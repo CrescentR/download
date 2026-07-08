@@ -1,0 +1,22 @@
+{
+  "name": "ytdlp-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "dev:frontend": "vite --host 127.0.0.1 --port 1420",
+    "build:frontend": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 1420"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.11.1",
+    "@tauri-apps/plugin-dialog": "2.7.1",
+    "lucide": "1.23.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "vite": "8.1.3"
+  }
+}
