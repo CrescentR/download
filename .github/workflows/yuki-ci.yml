@@ -1,0 +1,41 @@
+name: Yuki desktop checks
+on:
+  pull_request:
+    paths: ['gui/**', '.github/workflows/yuki-*.yml']
+  push:
+    paths: ['gui/**', '.github/workflows/yuki-*.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gui/src-tauri -> target
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf liblzma-dev
+      - run: python -m pip install -e .
+      - run: npm ci
+        working-directory: gui
+      - run: npm run build:frontend
+        working-directory: gui
+      - run: cargo test --locked --lib -j 2
+        working-directory: gui/src-tauri

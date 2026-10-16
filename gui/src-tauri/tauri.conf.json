@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "yt-dlp Studio",
-  "version": "0.1.0",
-  "identifier": "dev.ytdlp.studio",
+  "productName": "Yuki",
+  "version": "0.3.4",
+  "identifier": "dev.yuki.downloader",
   "build": {
     "beforeDevCommand": "npm run dev:frontend",
     "beforeBuildCommand": "npm run build:frontend",
@@ -12,13 +12,16 @@
   "app": {
     "windows": [
       {
-        "title": "yt-dlp Studio",
-        "width": 1280,
-        "height": 820,
-        "minWidth": 980,
-        "minHeight": 660,
+        "label": "main",
+        "title": "Yuki · 雪迹",
+        "width": 1180,
+        "height": 800,
+        "minWidth": 940,
+        "minHeight": 620,
         "resizable": true,
-        "center": true
+        "decorations": false,
+        "center": true,
+        "theme": "Dark"
       }
     ],
     "security": {
@@ -29,10 +32,29 @@
     "active": true,
     "targets": "all",
     "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "license": "Unlicense",
+    "licenseFile": "../../LICENSE",
+    "resources": {
+      "resources/yt-dlp-plugins/douyin-compat/yt_dlp_plugins/extractor/yuki_douyin.py": "yt-dlp-plugins/douyin-compat/yt_dlp_plugins/extractor/yuki_douyin.py",
+      "../../LICENSE": "licenses/Yuki-LICENSE.txt",
+      "../THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../licenses/": "licenses/fonts/"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true
+      }
+    },
     "category": "Utility",
-    "shortDescription": "A native desktop shell for yt-dlp",
-    "longDescription": "yt-dlp Studio gives yt-dlp a polished native desktop interface while keeping the downloader core unchanged."
+    "shortDescription": "A fast, focused desktop front-end for yt-dlp",
+    "longDescription": "Yuki is a native desktop front-end for yt-dlp. It analyzes a link before downloading, exposes real format selection, browser cookies, proxying, and keeps downloads manageable in a live queue."
   }
 }

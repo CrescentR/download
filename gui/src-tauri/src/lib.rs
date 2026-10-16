@@ -1,691 +1,1226 @@
-use regex::Regex;
-use serde::{Deserialize, Serialize};
+//! Tauri command surface and the download queue.
+//!
+//! Downloads are supervised here rather than inside the command handler, so a
+//! long download never blocks the webview and the queue can start the next
+//! task automatically when one finishes.
+
+mod cookies;
+mod deps;
+mod download;
+mod probe;
+mod runtime;
+mod settings;
+mod update;
+
+use download::{DownloadManager, DownloadPayload, TaskSnapshot};
+use serde::Serialize;
+use serde_json::json;
 use std::{
-    collections::HashMap,
-    env,
-    path::PathBuf,
-    process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
+    process::Child,
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
-#[derive(Default)]
-struct AppState {
-    tasks: Mutex<HashMap<String, TaskSnapshot>>,
-    children: Mutex<HashMap<String, Arc<Mutex<Child>>>>,
-}
+/// How long the analysis step may run before we give up.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(150);
+/// Completed downloads kept in the persistent library.
+const HISTORY_LIMIT: usize = 300;
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DownloadPayload {
-    urls: Vec<String>,
-    format_preset: String,
-    output_dir: String,
-    output_template: String,
-    playlist_mode: String,
-    audio_format: String,
-    custom_format: String,
-    embed_metadata: bool,
-    embed_thumbnail: bool,
-    write_subtitles: bool,
-    write_auto_subtitles: bool,
-    embed_subtitles: bool,
-    write_info_json: bool,
-    subtitle_langs: String,
-    cookies_browser: String,
-    rate_limit: String,
-    concurrent_fragments: String,
-    proxy: String,
-    download_archive: String,
-    retries: String,
-    custom_args: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TaskSnapshot {
-    id: String,
-    urls: Vec<String>,
-    args: Vec<String>,
-    command: Vec<String>,
-    created_at: f64,
-    started_at: Option<f64>,
-    ended_at: Option<f64>,
-    status: String,
-    exit_code: Option<i32>,
-    progress: Option<f64>,
-    eta: Option<String>,
-    speed: Option<String>,
-    size: Option<String>,
-    title: String,
-    output_dir: Option<String>,
-    logs: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeInfo {
-    mode: String,
-    runner: String,
-    repo_root: String,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct FfmpegStatus {
-    installed: bool,
-    version: Option<String>,
-    path: Option<String>,
-    install_supported: bool,
-    install_command: Option<String>,
-    platform: String,
-    package_manager: Option<String>,
-    guidance: String,
-}
+/// The async `analyze_url` command cannot take `State`, so the handle lives here.
+static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InstallResult {
     success: bool,
     message: String,
-    stdout: String,
-    stderr: String,
-    status: FfmpegStatus,
+    status: deps::FfmpegStatus,
 }
 
-fn now() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or_default()
+/// A payload waiting for a free slot. The task id is allocated at enqueue time
+/// so a queued download can still be cancelled and shown in the list.
+pub struct QueuedTask {
+    pub id: String,
+    pub payload: DownloadPayload,
 }
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .canonicalize()
-        .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-}
-
-fn runtime() -> (String, String, Vec<String>, PathBuf) {
-    let root = repo_root();
-    if let Ok(bin) = env::var("YTDLP_STUDIO_BIN") {
-        return ("Sidecar".into(), bin.clone(), vec![bin], root);
-    }
-    if root.join("yt_dlp").join("__main__.py").exists() {
-        let python = env::var("PYTHON").unwrap_or_else(|_| "python".into());
-        return (
-            "Repo module".into(),
-            format!("{python} -m yt_dlp"),
-            vec![python, "-m".into(), "yt_dlp".into()],
-            root,
-        );
-    }
-    (
-        "PATH".into(),
-        "yt-dlp".into(),
-        vec!["yt-dlp".into()],
-        env::current_dir().unwrap_or(root),
-    )
-}
-
-fn command_exists(program: &str) -> bool {
-    Command::new(program)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn ffmpeg_install_plan() -> (bool, Option<String>, String) {
-    if cfg!(target_os = "windows") {
-        if command_exists("winget") {
-            return (
-                true,
-                Some("winget install --id Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements".into()),
-                "Use the Install button to install FFmpeg with winget, then restart StreamFlow if PATH is not refreshed automatically.".into(),
-            );
-        }
-        if command_exists("choco") {
-            return (
-                true,
-                Some("choco install ffmpeg -y".into()),
-                "Use the Install button to install FFmpeg with Chocolatey, then restart StreamFlow if PATH is not refreshed automatically.".into(),
-            );
-        }
-        if command_exists("scoop") {
-            return (
-                true,
-                Some("scoop install ffmpeg".into()),
-                "Use the Install button to install FFmpeg with Scoop, then restart StreamFlow if PATH is not refreshed automatically.".into(),
-            );
-        }
-        return (
-            false,
-            None,
-            "Install FFmpeg manually from https://ffmpeg.org/download.html, or install a package manager such as winget, Chocolatey, or Scoop.".into(),
-        );
-    }
-
-    if cfg!(target_os = "macos") {
-        if command_exists("brew") {
-            return (
-                true,
-                Some("brew install ffmpeg".into()),
-                "Use the Install button to install FFmpeg with Homebrew.".into(),
-            );
-        }
-        return (
-            false,
-            None,
-            "Install Homebrew first, then run `brew install ffmpeg`, or install FFmpeg manually from https://ffmpeg.org/download.html.".into(),
-        );
-    }
-
-    if command_exists("apt-get") {
-        return (
-            false,
-            Some("sudo apt-get update && sudo apt-get install -y ffmpeg".into()),
-            "Install FFmpeg in a terminal with apt. StreamFlow does not run sudo installers directly because GUI password prompts vary by Linux distribution.".into(),
-        );
-    }
-    if command_exists("dnf") {
-        return (
-            false,
-            Some("sudo dnf install -y ffmpeg".into()),
-            "Install FFmpeg in a terminal with dnf. StreamFlow does not run sudo installers directly because GUI password prompts vary by Linux distribution.".into(),
-        );
-    }
-    if command_exists("pacman") {
-        return (
-            false,
-            Some("sudo pacman -S --needed ffmpeg".into()),
-            "Install FFmpeg in a terminal with pacman. StreamFlow does not run sudo installers directly because GUI password prompts vary by Linux distribution.".into(),
-        );
-    }
-
-    (
-        false,
-        None,
-        "Install FFmpeg with your system package manager, then make sure `ffmpeg` is available on PATH.".into(),
-    )
-}
-
-fn platform_name() -> String {
-    if cfg!(target_os = "windows") {
-        "windows".into()
-    } else if cfg!(target_os = "macos") {
-        "macos".into()
-    } else if cfg!(target_os = "linux") {
-        "linux".into()
+fn js_runtime_for(settings: &settings::Settings) -> Option<String> {
+    if settings.use_js_runtime {
+        runtime::detect_js_runtime()
     } else {
-        env::consts::OS.into()
-    }
-}
-
-fn package_manager_name(command: &Option<String>) -> Option<String> {
-    let command = command.as_deref()?;
-    let mut parts = command.split_whitespace();
-    match parts.next()? {
-        "sudo" => parts.next().map(str::to_string),
-        first => Some(first.to_string()),
-    }
-}
-
-fn ffmpeg_status_inner() -> FfmpegStatus {
-    let (install_supported, install_command, guidance) = ffmpeg_install_plan();
-    let package_manager = package_manager_name(&install_command);
-    match Command::new("ffmpeg").arg("-version").output() {
-        Ok(output) if output.status.success() => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let first_line = stdout.lines().next().unwrap_or("ffmpeg is installed").to_string();
-            FfmpegStatus {
-                installed: true,
-                version: Some(first_line),
-                path: Some("ffmpeg".into()),
-                install_supported,
-                install_command,
-                platform: platform_name(),
-                package_manager,
-                guidance: "FFmpeg is available. Merging, remuxing, audio extraction, metadata embedding, thumbnails, and subtitles can work normally.".into(),
-            }
-        }
-        _ => FfmpegStatus {
-            installed: false,
-            version: None,
-            path: None,
-            install_supported,
-            install_command,
-            platform: platform_name(),
-            package_manager,
-            guidance,
-        },
-    }
-}
-
-fn escape_applescript(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-fn launch_install_terminal(command: &str) -> Result<(), String> {
-    if cfg!(target_os = "windows") {
-        let terminal_command = format!(
-            "{command} & echo. & echo FFmpeg installer finished. Restart StreamFlow, then click Recheck."
-        );
-        Command::new("cmd")
-            .args(["/C", "start", "StreamFlow FFmpeg Installer", "cmd", "/K", &terminal_command])
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("Failed to launch installer terminal: {error}"))
-    } else if cfg!(target_os = "macos") {
-        let terminal_command = format!(
-            "{}; echo; echo FFmpeg installer finished. Restart StreamFlow, then click Recheck.",
-            escape_applescript(command)
-        );
-        let script = format!("tell application \"Terminal\" to do script \"{terminal_command}\"");
-        Command::new("osascript")
-            .args(["-e", &script])
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("Failed to launch Terminal: {error}"))
-    } else {
-        let terminal_command = format!(
-            "{command}; echo; echo 'FFmpeg installer finished. Restart StreamFlow, then click Recheck.'; exec sh"
-        );
-        let terminals: [(&str, Vec<&str>); 4] = [
-            ("x-terminal-emulator", vec!["-e", "sh", "-lc"]),
-            ("gnome-terminal", vec!["--", "sh", "-lc"]),
-            ("konsole", vec!["-e", "sh", "-lc"]),
-            ("xterm", vec!["-e", "sh", "-lc"]),
-        ];
-        for (program, args) in terminals {
-            let mut command_builder = Command::new(program);
-            command_builder.args(args).arg(&terminal_command);
-            if command_builder.spawn().is_ok() {
-                return Ok(());
-            }
-        }
-        Command::new("sh")
-            .args(["-lc", &terminal_command])
-            .spawn()
-            .map(|_| ())
-            .map_err(|error| format!("Failed to launch installer shell: {error}"))
-    }
-}
-
-fn clean_urls(urls: &[String]) -> Vec<String> {
-    urls.iter()
-        .map(|url| url.trim())
-        .filter(|url| !url.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn push_pair(args: &mut Vec<String>, flag: &str, value: &str) {
-    let clean = value.trim();
-    if !clean.is_empty() {
-        args.push(flag.into());
-        args.push(clean.into());
-    }
-}
-
-fn build_args(payload: &DownloadPayload) -> Result<(Vec<String>, Vec<String>, Option<String>), String> {
-    let urls = clean_urls(&payload.urls);
-    if urls.is_empty() {
-        return Err("At least one URL is required".into());
-    }
-
-    let mut args = vec!["--newline".into(), "--no-colors".into()];
-    let output_dir = payload.output_dir.trim();
-    let output_dir = if output_dir.is_empty() {
         None
+    }
+}
+
+fn effective_output_dir(payload: &DownloadPayload, settings: &settings::Settings) -> String {
+    if payload.output_dir.trim().is_empty() {
+        settings.output_dir.clone()
     } else {
-        args.push("-P".into());
-        args.push(output_dir.into());
-        Some(output_dir.into())
+        payload.output_dir.clone()
+    }
+}
+
+fn make_snapshot(id: &str, payload: &DownloadPayload, output_dir: &str) -> TaskSnapshot {
+    let title = if payload.title.trim().is_empty() {
+        payload
+            .urls
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "New download".into())
+    } else {
+        payload.title.trim().to_string()
     };
-
-    let output_template = payload.output_template.trim();
-    if !output_template.is_empty() {
-        args.push("-o".into());
-        args.push(output_template.into());
-    }
-
-    match payload.format_preset.as_str() {
-        "mp4" => {
-            args.extend(
-                ["-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b", "--merge-output-format", "mp4"]
-                    .map(String::from),
-            );
-        }
-        "audio" => {
-            args.extend(["-x", "--audio-format"].map(String::from));
-            args.push(if payload.audio_format.trim().is_empty() {
-                "mp3"
-            } else {
-                payload.audio_format.trim()
-            }
-            .into());
-        }
-        "custom" => push_pair(&mut args, "-f", &payload.custom_format),
-        _ => {}
-    }
-
-    match payload.playlist_mode.as_str() {
-        "single" => args.push("--no-playlist".into()),
-        "playlist" => args.push("--yes-playlist".into()),
-        _ => {}
-    }
-
-    if payload.embed_metadata {
-        args.push("--embed-metadata".into());
-    }
-    if payload.embed_thumbnail {
-        args.push("--embed-thumbnail".into());
-    }
-    if payload.write_subtitles {
-        args.push("--write-subs".into());
-    }
-    if payload.write_auto_subtitles {
-        args.push("--write-auto-subs".into());
-    }
-    if payload.embed_subtitles {
-        args.push("--embed-subs".into());
-    }
-    if payload.write_info_json {
-        args.push("--write-info-json".into());
-    }
-
-    push_pair(&mut args, "--sub-langs", &payload.subtitle_langs);
-    push_pair(&mut args, "--cookies-from-browser", &payload.cookies_browser);
-    push_pair(&mut args, "-r", &payload.rate_limit);
-    push_pair(&mut args, "--concurrent-fragments", &payload.concurrent_fragments);
-    push_pair(&mut args, "--proxy", &payload.proxy);
-    push_pair(&mut args, "--download-archive", &payload.download_archive);
-    push_pair(&mut args, "--retries", &payload.retries);
-
-    args.extend(payload.custom_args.iter().filter(|arg| !arg.trim().is_empty()).cloned());
-    args.extend(urls.iter().cloned());
-    Ok((args, urls, output_dir))
-}
-
-fn redact(command: &[String]) -> Vec<String> {
-    let secret_flags = ["--password", "--ap-password", "--video-password"];
-    let mut redact_next = false;
-    command
-        .iter()
-        .map(|part| {
-            if redact_next {
-                redact_next = false;
-                "********".into()
-            } else if secret_flags.contains(&part.as_str()) {
-                redact_next = true;
-                part.clone()
-            } else if let Some(flag) = secret_flags.iter().find(|flag| part.starts_with(&format!("{flag}="))) {
-                format!("{flag}=********")
-            } else {
-                part.clone()
-            }
-        })
-        .collect()
-}
-
-fn emit_task(app: &AppHandle, task: TaskSnapshot) {
-    let _ = app.emit("task-updated", task);
-}
-
-fn update_task(app: &AppHandle, id: &str, mutate: impl FnOnce(&mut TaskSnapshot)) -> Option<TaskSnapshot> {
-    let state = app.state::<AppState>();
-    let mut tasks = state.tasks.lock().ok()?;
-    let task = tasks.get_mut(id)?;
-    mutate(task);
-    let snapshot = task.clone();
-    drop(tasks);
-    emit_task(app, snapshot.clone());
-    Some(snapshot)
-}
-
-fn append_log(app: &AppHandle, id: &str, line: &str, progress_re: &Regex) {
-    let clean = line.trim_end().to_string();
-    if clean.is_empty() {
-        return;
-    }
-    update_task(app, id, |task| {
-        task.logs.push(clean.clone());
-        if task.logs.len() > 700 {
-            let keep_from = task.logs.len() - 700;
-            task.logs.drain(0..keep_from);
-        }
-        if let Some(captures) = progress_re.captures(&clean) {
-            task.progress = captures.name("percent").and_then(|value| value.as_str().parse().ok());
-            task.size = captures.name("size").map(|value| value.as_str().to_string()).or_else(|| task.size.clone());
-            task.speed = captures.name("speed").map(|value| value.as_str().to_string()).or_else(|| task.speed.clone());
-            task.eta = captures.name("eta").map(|value| value.as_str().to_string()).or_else(|| task.eta.clone());
-        }
-        if let Some(title) = clean.strip_prefix("[download] Destination:") {
-            task.title = title.trim().to_string();
-        }
-    });
-}
-
-#[tauri::command]
-fn runtime_info() -> RuntimeInfo {
-    let (mode, runner, _, cwd) = runtime();
-    RuntimeInfo {
-        mode,
-        runner,
-        repo_root: cwd.display().to_string(),
-    }
-}
-
-#[tauri::command]
-fn check_ffmpeg() -> FfmpegStatus {
-    ffmpeg_status_inner()
-}
-
-#[tauri::command]
-fn install_ffmpeg() -> Result<InstallResult, String> {
-    let before = ffmpeg_status_inner();
-    if before.installed {
-        return Ok(InstallResult {
-            success: true,
-            message: "FFmpeg is already installed.".into(),
-            stdout: String::new(),
-            stderr: String::new(),
-            status: before,
-        });
-    }
-
-    if !before.install_supported {
-        return Err(before.guidance.clone());
-    }
-    let command = before.install_command.clone().ok_or_else(|| before.guidance.clone())?;
-    launch_install_terminal(&command)?;
-    Ok(InstallResult {
-        success: true,
-        message: "Installer opened in a separate terminal. Finish the installer there, restart StreamFlow if needed, then click Recheck.".into(),
-        stdout: String::new(),
-        stderr: String::new(),
-        status: before,
-    })
-}
-
-#[tauri::command]
-fn list_tasks(state: State<AppState>) -> Result<Vec<TaskSnapshot>, String> {
-    let mut tasks = state
-        .tasks
-        .lock()
-        .map_err(|_| "Failed to lock task state".to_string())?
-        .values()
-        .cloned()
-        .collect::<Vec<_>>();
-    tasks.sort_by(|a, b| b.created_at.partial_cmp(&a.created_at).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(tasks)
-}
-
-#[tauri::command]
-fn get_task(state: State<AppState>, id: String) -> Result<Option<TaskSnapshot>, String> {
-    Ok(state
-        .tasks
-        .lock()
-        .map_err(|_| "Failed to lock task state".to_string())?
-        .get(&id)
-        .cloned())
-}
-
-#[tauri::command]
-fn start_download(app: AppHandle, state: State<AppState>, payload: DownloadPayload) -> Result<TaskSnapshot, String> {
-    let (args, urls, output_dir) = build_args(&payload)?;
-    let (_, _, mut command_parts, cwd) = runtime();
-    let program = command_parts.remove(0);
-    let mut command = command_parts.clone();
-    command.extend(args.clone());
-    let visible_command = redact(&std::iter::once(program.clone()).chain(command.iter().cloned()).collect::<Vec<_>>());
-    let id = Uuid::new_v4().simple().to_string()[..12].to_string();
-    let task = TaskSnapshot {
-        id: id.clone(),
-        urls: urls.clone(),
-        args: args.clone(),
-        command: visible_command,
-        created_at: now(),
-        started_at: Some(now()),
+    TaskSnapshot {
+        id: id.to_string(),
+        urls: payload.urls.clone(),
+        title,
+        status: "queued".into(),
+        quality: if payload.quality.trim().is_empty() {
+            "best".into()
+        } else {
+            payload.quality.clone()
+        },
+        output_dir: output_dir.to_string(),
+        created_at: download::now(),
+        started_at: None,
         ended_at: None,
-        status: "running".into(),
         exit_code: None,
         progress: None,
-        eta: None,
+        downloaded_bytes: None,
+        total_bytes: None,
         speed: None,
-        size: None,
-        title: urls.first().cloned().unwrap_or_else(|| "New download".into()),
-        output_dir,
+        eta: None,
+        fragment_index: None,
+        fragment_count: None,
+        thumbnail: if payload.thumbnail.trim().is_empty() {
+            None
+        } else {
+            Some(payload.thumbnail.clone())
+        },
+        duration: payload.duration,
+        playlist_count: None,
+        destination: None,
+        error: None,
+        command: Vec::new(),
         logs: Vec::new(),
+        dropped_logs: 0,
+    }
+}
+
+fn concurrency_limit(app: &AppHandle) -> usize {
+    settings::load(app).max_concurrent_downloads.max(1) as usize
+}
+
+/// Shared entry point for creating a task, whether fresh or on retry.
+fn enqueue(
+    manager: &Arc<DownloadManager>,
+    payload: DownloadPayload,
+) -> Result<TaskSnapshot, String> {
+    let settings = settings::load(&manager.app);
+    let js_runtime = js_runtime_for(&settings);
+
+    if payload.urls.iter().all(|url| url.trim().is_empty()) {
+        return Err("At least one URL is required.".into());
+    }
+    // Validate the argument build up front so the user sees an immediate error
+    // instead of a task that fails a moment later.
+    download::build_args_with_ffmpeg(
+        &payload,
+        &settings,
+        js_runtime.as_deref(),
+        Some(&settings::config_dir(&manager.app)),
+    )?;
+
+    let mut payload = payload;
+    if payload.output_template.trim().is_empty() {
+        payload.output_template = settings.output_template.clone();
+    }
+    if payload.quality.trim().is_empty() {
+        payload.quality = settings.quality.clone();
+    }
+
+    let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+    let output_dir = effective_output_dir(&payload, &settings);
+    let snapshot = make_snapshot(&id, &payload, &output_dir);
+
+    let start_now = {
+        let mut state = manager
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock task state".to_string())?;
+        state.tasks.insert(id.clone(), snapshot.clone());
+        state.payloads.insert(id.clone(), payload.clone());
+        if state.active < settings.max_concurrent_downloads.max(1) as usize {
+            true
+        } else {
+            state.pending.push_back(QueuedTask {
+                id: id.clone(),
+                payload: payload.clone(),
+            });
+            false
+        }
     };
-    state
-        .tasks
-        .lock()
-        .map_err(|_| "Failed to lock task state".to_string())?
-        .insert(id.clone(), task.clone());
 
-    let mut child = Command::new(&program)
-        .args(&command)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("Failed to start yt-dlp: {error}"))?;
+    if start_now {
+        spawn_task(manager.clone(), id.clone(), payload);
+    } else {
+        manager.emit_task(&snapshot);
+    }
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let child = Arc::new(Mutex::new(child));
-    state
-        .children
-        .lock()
-        .map_err(|_| "Failed to lock process state".to_string())?
-        .insert(id.clone(), child.clone());
+    Ok(manager.snapshot(&id).unwrap_or(snapshot))
+}
 
-    emit_task(&app, task.clone());
+/// Spawn a task's process and start supervising it.
+fn spawn_task(manager: Arc<DownloadManager>, id: String, payload: DownloadPayload) {
+    let app = manager.app.clone();
+    let settings = settings::load(&app);
+    let js_runtime = js_runtime_for(&settings);
+
+    let (spawned, command) = match download::spawn(
+        &payload,
+        &settings,
+        js_runtime.as_deref(),
+        Some(&settings::config_dir(&app)),
+        &id,
+    ) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            manager.update(&id, |task| {
+                task.status = "failed".into();
+                task.error = Some(error);
+                task.ended_at = Some(download::now());
+            });
+            finish_task(manager, id);
+            return;
+        }
+    };
+
+    {
+        let mut state = match manager.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        state.children.insert(id.clone(), spawned.child.clone());
+        state.active += 1;
+        if let Some(task) = state.tasks.get_mut(&id) {
+            task.status = "running".into();
+            task.started_at = Some(download::now());
+            task.command = command;
+        }
+    }
+    if let Some(snapshot) = manager.snapshot(&id) {
+        manager.emit_task(&snapshot);
+    }
+
+    // Output is redirected to a file, so follow it rather than reading pipes.
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let tailer = {
+        let manager = manager.clone();
+        let id = id.clone();
+        let running = running.clone();
+        std::thread::spawn(move || download::tail_output(manager, id, running))
+    };
+    let child = spawned.child;
 
     std::thread::spawn(move || {
-        let progress_re = Arc::new(
-            Regex::new(r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%.*?(?:of\s+~?(?P<size>\S+))?.*?(?:at\s+(?P<speed>\S+))?.*?(?:ETA\s+(?P<eta>\S+))?")
-                .expect("valid progress regex"),
-        );
-        let mut log_threads = Vec::new();
-        if let Some(stdout) = stdout {
-            let app = app.clone();
-            let id = id.clone();
-            let progress_re = progress_re.clone();
-            log_threads.push(std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader};
-                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                    append_log(&app, &id, &line, &progress_re);
+        let exit_code = download::wait_for_exit(&child);
+
+        // Tell the tailer the process is gone so it can drain and finish.
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = tailer.join();
+
+        {
+            let mut state = match manager.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            state.children.remove(&id);
+            // Release the queue slot only now that the process is truly gone.
+            state.active = state.active.saturating_sub(1);
+        }
+
+        // Metadata was written to a file rather than stdout, so read it back
+        // once the process has finished.
+        let metadata = download::read_metadata(&id);
+        download::clear_metadata(&id);
+        // The captured output has been folded into the task log; drop the file.
+        download::clear_log(&id);
+
+        manager.update(&id, |task| {
+            for (key, value) in &metadata {
+                match key.as_str() {
+                    "title" => task.title = value.clone(),
+                    "file" => task.destination = Some(value.clone()),
+                    "count" => {
+                        if let Ok(count) = value.parse::<usize>() {
+                            if count > 0 {
+                                task.playlist_count = Some(count);
+                            }
+                        }
+                    }
+                    "thumb" => task.thumbnail = Some(value.clone()),
+                    "duration" => task.duration = value.parse::<f64>().ok(),
+                    _ => {}
                 }
-            }));
-        }
-        if let Some(stderr) = stderr {
-            let app = app.clone();
-            let id = id.clone();
-            let progress_re = progress_re.clone();
-            log_threads.push(std::thread::spawn(move || {
-                use std::io::{BufRead, BufReader};
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    append_log(&app, &id, &line, &progress_re);
-                }
-            }));
-        }
+            }
 
-        for thread in log_threads {
-            let _ = thread.join();
-        }
-
-        let exit_code = child
-            .lock()
-            .ok()
-            .and_then(|mut process| process.wait().ok())
-            .and_then(|status| status.code());
-
-        let state = app.state::<AppState>();
-        if let Ok(mut children) = state.children.lock() {
-            children.remove(&id);
-        }
-        update_task(&app, &id, |task| {
+            if task.status == "pausing" {
+                task.status = "paused".into();
+                task.speed = None;
+                task.eta = None;
+                task.ended_at = None;
+                return;
+            }
             task.exit_code = exit_code;
-            task.ended_at = Some(now());
+            task.ended_at = Some(download::now());
             if task.status == "canceled" {
                 return;
             }
             if exit_code == Some(0) {
                 task.status = "completed".into();
                 task.progress = Some(100.0);
+                task.speed = None;
+                task.eta = None;
             } else {
                 task.status = "failed".into();
+                task.error = download::explain_failure(&task.logs)
+                    .or_else(|| Some(format!("yt-dlp exited with code {}", exit_code.unwrap_or(-1))));
             }
         });
-    });
 
-    Ok(task)
+        if let Some(snapshot) = manager.snapshot(&id) {
+            if snapshot.status == "completed" {
+                append_history(&manager.app, &snapshot);
+            }
+        }
+        finish_task(manager, id);
+    });
+}
+
+/// Start the next queued task if a slot is free. The caller must already have
+/// released its own slot.
+fn finish_task(manager: Arc<DownloadManager>, _finished: String) {
+    let next = {
+        let mut state = match manager.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.active >= concurrency_limit(&manager.app) {
+            return;
+        }
+        let queued = match state.pending.pop_front() {
+            Some(queued) => queued,
+            None => return,
+        };
+        let snapshot = {
+            let settings = settings::load(&manager.app);
+            let output = effective_output_dir(&queued.payload, &settings);
+            make_snapshot(&queued.id, &queued.payload, &output)
+        };
+        state.tasks.insert(queued.id.clone(), snapshot.clone());
+        Some((queued.id, queued.payload, snapshot))
+    };
+    if let Some((id, payload, snapshot)) = next {
+        manager.emit_task(&snapshot);
+        spawn_task(manager, id, payload);
+    }
+}
+
+fn append_history(app: &AppHandle, task: &TaskSnapshot) {
+    let mut history = settings::load_history(app);
+    let entries = match history.as_array_mut() {
+        Some(entries) => entries,
+        None => return,
+    };
+    entries.insert(
+        0,
+        json!({
+            "id": task.id,
+            "title": task.title,
+            "url": task.urls.first(),
+            "destination": task.destination,
+            "outputDir": task.output_dir,
+            "thumbnail": task.thumbnail,
+            "duration": task.duration,
+            "finishedAt": task.ended_at,
+            "size": task.total_bytes,
+        }),
+    );
+    entries.truncate(HISTORY_LIMIT);
+    let _ = settings::save_history(app, &history);
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn analyze_url(url: String, shallow: Option<bool>) -> Result<probe::ProbeResult, String> {
+    let url = url.trim().to_string();
+    if url.is_empty() {
+        return Err("Enter a URL first.".into());
+    }
+    if download::extract_url(&url).is_none() {
+        return Err("That does not look like an http(s) link.".into());
+    }
+
+    let app = APP_HANDLE.get().cloned().ok_or("App handle unavailable")?;
+    let settings = settings::load(&app);
+    let shallow = shallow.unwrap_or(false);
+    let config = settings::config_dir(&app);
+
+    // yt-dlp has no cancellation handle here, so bound the wait with a channel
+    // rather than letting the webview hang forever.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    tauri::async_runtime::spawn_blocking(move || {
+        std::thread::spawn(move || {
+            let result = probe::analyze_with(&url, &settings, shallow, Some(&config));
+            let _ = sender.send(result);
+        });
+        match receiver.recv_timeout(PROBE_TIMEOUT) {
+        Ok(result) => Ok(result),
+        Err(_) => Ok(probe::ProbeResult::timeout()),
+        }
+    }).await.map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
-fn cancel_task(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
-    update_task(&app, &id, |task| {
-        task.status = "canceled".into();
-        task.ended_at = Some(now());
-    })
-    .ok_or_else(|| "Task not found".to_string())?;
+fn get_settings(app: AppHandle) -> settings::Settings {
+    settings::load(&app)
+}
 
-    if let Some(child) = state
-        .children
+#[tauri::command]
+fn save_settings(app: AppHandle, mut value: settings::Settings, cookie_text: Option<String>, cookie_site: Option<String>) -> Result<settings::Settings, String> {
+    let imported = if let Some(text) = cookie_text.filter(|text| !text.trim().is_empty()) {
+        let path = cookies::import_for_site(&text, &settings::config_dir(&app).join("cookies"), cookie_site.as_deref().unwrap_or("bilibili"), &value.cookies_file)?;
+        value.cookies_file = path.clone();
+        value.cookies_browser.clear();
+        Some(path)
+    } else { None };
+    if let Err(error) = settings::save(&app, &value) {
+        if let Some(path) = imported { let _ = std::fs::remove_file(path); }
+        return Err(error);
+    }
+    Ok(settings::load(&app))
+}
+
+#[tauri::command]
+async fn runtime_info(manager: State<'_, Arc<DownloadManager>>) -> Result<runtime::RuntimeInfo, String> {
+    let config = settings::config_dir(&manager.app);
+    tauri::async_runtime::spawn_blocking(move || runtime::info_with(Some(&config)))
+        .await.map_err(|error| error.to_string())
+}
+
+/// Query GitHub for newer yt-dlp / FFmpeg builds.
+#[tauri::command]
+async fn check_updates(
+    manager: State<'_, Arc<DownloadManager>>,
+    component: String,
+) -> Result<update::UpdateCheck, String> {
+    if component != "ytdlp" && component != "ffmpeg" {
+        return Err("Unknown update component".into());
+    }
+    let config = settings::config_dir(&manager.app);
+    let settings = settings::load(&manager.app);
+    let proxy = update::resolve_proxy(Some(&settings.proxy));
+
+    let check = tauri::async_runtime::spawn_blocking(move || {
+        if component == "ffmpeg" {
+            let current = deps::ffmpeg_status_with(Some(&config), &settings.ffmpeg_location).version;
+            update::check_ffmpeg(&config, current.as_deref(), proxy.as_deref())
+        } else {
+            let current = runtime::info_with(Some(&config)).ytdlp_version;
+            update::check_ytdlp(&config, current.as_deref(), proxy.as_deref())
+        }
+    })
+    .await
+    .map_err(|error| format!("update check failed: {error}"))?;
+
+    Ok(check)
+}
+
+/// Download and install the latest yt-dlp into the app's own data directory.
+///
+/// Progress is emitted as `update-progress` events so the UI can show a bar.
+#[tauri::command]
+async fn install_ytdlp_update(
+    app: AppHandle,
+    manager: State<'_, Arc<DownloadManager>>,
+) -> Result<update::InstallReport, String> {
+    let config = settings::config_dir(&manager.app);
+    let settings_value = settings::load(&manager.app);
+    let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    let emitter = app.clone();
+
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let mut last_emit = std::time::Instant::now();
+        let mut progress = |written: u64, total: Option<u64>| {
+            // Throttle: the download loop calls this per 128 KiB chunk.
+            if last_emit.elapsed().as_millis() >= 150 {
+                last_emit = std::time::Instant::now();
+                let _ = emitter.emit(
+                    "update-progress",
+                    json!({ "component": "ytdlp", "downloaded": written, "total": total }),
+                );
+            }
+        };
+        update::install_ytdlp(&config, proxy.as_deref(), &mut progress)
+    })
+    .await
+    .map_err(|error| format!("update failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    Ok(report)
+}
+
+/// Download and install a managed FFmpeg build.
+#[tauri::command]
+async fn install_ffmpeg_update(
+    app: AppHandle,
+    manager: State<'_, Arc<DownloadManager>>,
+) -> Result<update::InstallReport, String> {
+    let config = settings::config_dir(&manager.app);
+    let settings_value = settings::load(&manager.app);
+    let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    let emitter = app.clone();
+
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let mut last_emit = std::time::Instant::now();
+        let mut progress = |written: u64, total: Option<u64>| {
+            if last_emit.elapsed().as_millis() >= 150 {
+                last_emit = std::time::Instant::now();
+                let _ = emitter.emit(
+                    "update-progress",
+                    json!({ "component": "ffmpeg", "downloaded": written, "total": total }),
+                );
+            }
+        };
+        update::install_ffmpeg(&config, proxy.as_deref(), &mut progress)
+    })
+    .await
+    .map_err(|error| format!("update failed: {error}"))?
+    .map_err(|error| error.to_string())?;
+
+    Ok(report)
+}
+
+#[tauri::command]
+async fn check_ffmpeg(app: AppHandle) -> Result<deps::FfmpegStatus, String> {
+    let config = settings::config_dir(&app);
+    let value = settings::load(&app);
+    tauri::async_runtime::spawn_blocking(move || deps::ffmpeg_status_with(Some(&config), &value.ffmpeg_location))
+        .await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn install_ffmpeg() -> Result<InstallResult, String> {
+    let before = deps::ffmpeg_status();
+    if before.installed {
+        return Ok(InstallResult {
+            success: true,
+            message: "FFmpeg is already installed.".into(),
+            status: before,
+        });
+    }
+    if !before.install_supported {
+        return Err(before.guidance.clone());
+    }
+    let command = before
+        .install_command
+        .clone()
+        .ok_or_else(|| before.guidance.clone())?;
+    deps::launch_install_terminal(&command)?;
+    Ok(InstallResult {
+        success: true,
+        message: "Installer opened in a separate terminal. Finish it, then click Recheck.".into(),
+        status: before,
+    })
+}
+
+#[tauri::command]
+fn list_tasks(manager: State<Arc<DownloadManager>>) -> Result<Vec<TaskSnapshot>, String> {
+    let state = manager
+        .state
         .lock()
-        .map_err(|_| "Failed to lock process state".to_string())?
-        .get(&id)
-        .cloned()
+        .map_err(|_| "Failed to lock task state".to_string())?;
+    let mut tasks: Vec<TaskSnapshot> = state.tasks.values().cloned().collect();
+    tasks.sort_by(|a, b| {
+        b.created_at
+            .partial_cmp(&a.created_at)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(tasks)
+}
+
+#[tauri::command]
+fn get_history(app: AppHandle) -> serde_json::Value {
+    settings::load_history(&app)
+}
+
+#[tauri::command]
+fn start_download(
+    manager: State<Arc<DownloadManager>>,
+    payload: DownloadPayload,
+) -> Result<TaskSnapshot, String> {
+    enqueue(manager.inner(), payload)
+}
+
+/// Re-run a finished or failed task using its original payload, so a format
+/// chosen in the analysis panel is preserved rather than falling back to the
+/// preset.
+#[tauri::command]
+fn retry_task(
+    manager: State<Arc<DownloadManager>>,
+    id: String,
+) -> Result<TaskSnapshot, String> {
+    let payload = {
+        let state = manager
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock task state".to_string())?;
+        state.payloads.get(&id).cloned()
+    };
+    let payload = payload.ok_or_else(|| "The original request is no longer available.".to_string())?;
+    enqueue(manager.inner(), payload)
+}
+
+/// Pause keeps partial files and the original request; resume reuses its id.
+#[tauri::command]
+fn pause_task(manager: State<Arc<DownloadManager>>, id: String) -> Result<(), String> {
+    let child = {
+        let mut state = manager.state.lock().map_err(|_| "Failed to lock tasks")?;
+        let status = state.tasks.get(&id).ok_or("Task no longer exists")?.status.clone();
+        if !matches!(status.as_str(), "queued" | "running") {
+            return Err("Only queued or downloading tasks can be paused".into());
+        }
+        state.pending.retain(|queued| queued.id != id);
+        let child = state.children.get(&id).cloned();
+        let task = state.tasks.get_mut(&id).ok_or("Task no longer exists")?;
+        task.status = if child.is_some() { "pausing" } else { "paused" }.into();
+        task.speed = None;
+        task.eta = None;
+        child
+    };
+    if let Some(snapshot) = manager.snapshot(&id) { manager.emit_task(&snapshot); }
+    if let Some(child) = child { download::terminate(&child); }
+    Ok(())
+}
+
+#[tauri::command]
+fn resume_task(manager: State<Arc<DownloadManager>>, id: String) -> Result<(), String> {
     {
-        if let Ok(mut process) = child.lock() {
-            let _ = process.kill();
+        let mut state = manager.state.lock().map_err(|_| "Failed to lock tasks")?;
+        if state.tasks.get(&id).ok_or("Task no longer exists")?.status != "paused" {
+            return Err("Wait for the task to finish pausing before resuming".into());
+        }
+        let payload = state.payloads.get(&id).cloned().ok_or("Original request is unavailable")?;
+        state.tasks.get_mut(&id).ok_or("Task no longer exists")?.status = "queued".into();
+        state.pending.push_back(QueuedTask { id: id.clone(), payload });
+    }
+    if let Some(snapshot) = manager.snapshot(&id) { manager.emit_task(&snapshot); }
+    finish_task(manager.inner().clone(), id);
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_task(manager: State<Arc<DownloadManager>>, id: String) -> Result<(), String> {
+    let child: Option<Arc<Mutex<Child>>> = {
+        let state = manager
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock task state".to_string())?;
+        state.children.get(&id).cloned()
+    };
+
+    match child {
+        Some(child) => {
+            manager.update(&id, |task| {
+                task.status = "canceled".into();
+                task.error = None;
+                task.speed = None;
+                task.eta = None;
+                task.ended_at = Some(download::now());
+            });
+            // Kill the whole tree: yt-dlp spawns ffmpeg for merging.
+            download::terminate(&child);
+        }
+        None => {
+            {
+                let mut state = manager
+                    .state
+                    .lock()
+                    .map_err(|_| "Failed to lock task state".to_string())?;
+                state.pending.retain(|queued| queued.id != id);
+            }
+            manager.update(&id, |task| {
+                if task.is_active() {
+                    task.status = "canceled".into();
+                    task.ended_at = Some(download::now());
+                }
+            });
         }
     }
     Ok(())
 }
 
+#[tauri::command]
+fn remove_task(manager: State<Arc<DownloadManager>>, id: String) -> Result<(), String> {
+    {
+        let mut state = manager
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock task state".to_string())?;
+        if let Some(child) = state.children.get(&id).cloned() {
+            download::terminate(&child);
+        }
+        state.children.remove(&id);
+        state.pending.retain(|queued| queued.id != id);
+        state.payloads.remove(&id);
+        state.tasks.remove(&id);
+    }
+    let _ = manager
+        .app
+        .emit("task-removed", json!({ "id": id }));
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_finished(manager: State<Arc<DownloadManager>>) -> Result<Vec<String>, String> {
+    let mut removed = Vec::new();
+    {
+        let mut state = manager
+            .state
+            .lock()
+            .map_err(|_| "Failed to lock task state".to_string())?;
+        let ids: Vec<String> = state
+            .tasks
+            .iter()
+            .filter(|(_, task)| !task.is_active())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            state.tasks.remove(&id);
+            state.payloads.remove(&id);
+            removed.push(id);
+        }
+    }
+    if !removed.is_empty() {
+        let _ = manager
+            .app
+            .emit("tasks-cleared", json!({ "ids": removed.clone() }));
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+fn reveal_path(app: AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+
+    let raw = path.trim();
+    if raw.is_empty() {
+        return Err("Nothing to reveal.".into());
+    }
+    // Release links must be opened by the system browser, not treated as paths.
+    if raw.starts_with("https://github.com/") {
+        return app.opener().open_url(raw, None::<&str>)
+            .map_err(|error| format!("Could not open release page: {error}"));
+    }
+    let target = Path::new(raw);
+
+    if target.is_dir() {
+        return app
+            .opener()
+            .open_path(raw.to_string(), None::<&str>)
+            .map_err(|error| format!("Could not open folder: {error}"));
+    }
+
+    if target.is_file() {
+        // Pass a path to the native reveal API. Explorer's /select command-line
+        // parsing can misinterpret a quoted argument containing spaces/commas.
+        // The opener uses SHOpenFolderAndSelectItems on Windows and handles
+        // platform path normalization without building a shell command.
+        return app.opener().reveal_item_in_dir(target)
+            .map_err(|error| format!("Could not reveal downloaded file: {error}"));
+    }
+
+    // The file may have been moved or deleted; fall back to its directory.
+    match target.parent() {
+        Some(parent) if parent.is_dir() => app
+            .opener()
+            .open_path(parent.display().to_string(), None::<&str>)
+            .map_err(|error| format!("Could not open folder: {error}")),
+        _ => Err("That path no longer exists.".into()),
+    }
+}
+
+#[tauri::command]
+fn copy_diagnostics(manager: State<Arc<DownloadManager>>) -> String {
+    let settings = settings::load(&manager.app);
+    let config = settings::config_dir(&manager.app);
+    let rt = runtime::info_with(Some(&config));
+    let ffmpeg = deps::ffmpeg_status_with(Some(&config), &settings.ffmpeg_location);
+
+    let mut lines = vec![
+        "Yuki diagnostics".to_string(),
+        format!("runtime mode : {}", rt.mode),
+        format!("runner       : {}", rt.runner),
+        format!(
+            "yt-dlp       : {}",
+            rt.ytdlp_version.unwrap_or_else(|| "unknown".into())
+        ),
+        format!(
+            "js runtime   : {}",
+            rt.js_runtime.unwrap_or_else(|| "none".into())
+        ),
+        format!(
+            "ffmpeg       : {}",
+            ffmpeg.version.unwrap_or_else(|| "missing".into())
+        ),
+        format!("platform     : {}", ffmpeg.platform),
+        format!("output dir   : {}", settings.output_dir),
+        format!("quality      : {}", settings.quality),
+        format!(
+            "cookies      : {}",
+            if settings.cookies_browser.trim().is_empty() {
+                "none".to_string()
+            } else {
+                settings.cookies_browser.clone()
+            }
+        ),
+        format!(
+            "proxy        : {}",
+            if settings.proxy.trim().is_empty() {
+                "none".to_string()
+            } else {
+                "configured (redacted)".to_string()
+            }
+        ),
+    ];
+
+    if let Ok(state) = manager.state.lock() {
+        let failures: Vec<String> = state
+            .tasks
+            .values()
+            .filter_map(|task| task.error.as_ref().map(|error| format!("- {}: {error}", task.title)))
+            .take(5)
+            .collect();
+        if !failures.is_empty() {
+            lines.push(String::new());
+            lines.push("Recent errors:".into());
+            lines.extend(failures);
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Headless reproduction path.
+///
+/// `yuki --diagnose <url>` builds the exact argument vector a real download
+/// would use and prints it, then runs it with inherited stdio. This exists
+/// because a GUI-launched child is hard to inspect, and UI logs are lossy.
+fn run_diagnose(url: &str) -> i32 {
+    let settings = settings::load_for_diagnose();
+    let config = settings::diagnose_config_dir();
+    let launch = runtime::resolve_with(Some(&config));
+
+    println!("== Yuki diagnose ==");
+    println!("runtime mode : {}", launch.mode);
+    println!("runner       : {}", launch.runner);
+    if let Some(problem) = &launch.problem {
+        println!("problem      : {problem}");
+    }
+    println!("repo root    : {}", launch.cwd.display());
+    println!("output dir   : {}", settings.output_dir);
+
+    let js_runtime = js_runtime_for(&settings);
+    let payload = DownloadPayload {
+        urls: vec![url.to_string()],
+        quality: settings.quality.clone(),
+        format_id: String::new(),
+        output_dir: settings.output_dir.clone(),
+        output_template: settings.output_template.clone(),
+        playlist_mode: "single".into(),
+        playlist_items: String::new(),
+        audio_format: "mp3".into(),
+        embed_metadata: settings.embed_metadata,
+        embed_thumbnail: settings.embed_thumbnail,
+        write_subtitles: false,
+        write_auto_subtitles: settings.write_auto_subtitles,
+        embed_subtitles: settings.embed_subtitles,
+        write_info_json: settings.write_info_json,
+        subtitle_langs: settings.subtitle_langs.clone(),
+        cookies_browser: settings.cookies_browser.clone(),
+        cookies_file: settings.cookies_file.clone(),
+        rate_limit: settings.rate_limit.clone(),
+        proxy: settings.proxy.clone(),
+        download_archive: settings.download_archive.clone(),
+        retries: settings.retries.to_string(),
+        concurrent_fragments: settings.concurrent_fragments.to_string(),
+        use_js_runtime: settings.use_js_runtime,
+        custom_args: Vec::new(),
+        title: String::new(),
+        thumbnail: String::new(),
+        duration: None,
+    };
+
+    // Mirror the real download path, including the metadata file.
+    let meta = download::metadata_path("diagnose");
+    download::clear_metadata("diagnose");
+    let (args, urls) = match download::build_args_with_meta(
+        &payload,
+        &settings,
+        js_runtime.as_deref(),
+        Some(&config),
+        Some(&meta),
+    ) {
+        Ok(built) => built,
+        Err(error) => {
+            eprintln!("failed to build arguments: {error}");
+            return 1;
+        }
+    };
+
+    println!("\n== arguments ==");
+    println!("{} {}", launch.program, args.join(" "));
+
+    let piped = std::env::var("YUKI_DIAGNOSE_PIPED").is_ok();
+    if piped {
+        // Mirror the real download path exactly: piped stdio, drained on two
+        // threads. This is the configuration that surfaced the GBK encoding
+        // failure, so it is the one worth verifying.
+        println!("\n== running with PIPED stdio (mirrors the app) ==\n");
+        use std::io::{BufRead, BufReader};
+
+        let mut child = match runtime::build_command(&launch)
+            .args(&args)
+            .current_dir(&launch.cwd)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("failed to spawn: {error}");
+                return 1;
+            }
+        };
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let mut failures: Vec<String> = Vec::new();
+
+        let handles = [
+            stdout.map(|reader| {
+                std::thread::spawn(move || {
+                    let mut collected = Vec::new();
+                    for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                        collected.push(line);
+                    }
+                    collected
+                })
+            }),
+            stderr.map(|reader| {
+                std::thread::spawn(move || {
+                    let mut collected = Vec::new();
+                    for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                        collected.push(line);
+                    }
+                    collected
+                })
+            }),
+        ];
+
+        let mut out_lines = Vec::new();
+        let mut err_lines = Vec::new();
+        for (index, handle) in handles.into_iter().enumerate() {
+            if let Some(handle) = handle {
+                let lines = handle.join().unwrap_or_default();
+                if index == 0 {
+                    out_lines = lines;
+                } else {
+                    err_lines = lines;
+                }
+            }
+        }
+
+        let code = child.wait().ok().and_then(|status| status.code());
+
+        for line in &out_lines {
+            if line.contains("Errno") || line.contains("OSError") {
+                failures.push(format!("stdout: {line}"));
+            }
+        }
+        for line in &err_lines {
+            if line.contains("Errno") || line.contains("OSError") || line.contains("Ignored when") {
+                failures.push(format!("stderr: {line}"));
+            }
+        }
+
+        println!("stdout lines : {}", out_lines.len());
+        println!("stderr lines : {}", err_lines.len());
+        println!("--- stderr ---");
+        for line in err_lines.iter().take(40) {
+            println!("{line}");
+        }
+        println!("--- stdout (last 6) ---");
+        for line in out_lines.iter().rev().take(6).collect::<Vec<_>>().iter().rev() {
+            println!("{line}");
+        }
+
+        if failures.is_empty() && code == Some(0) {
+            println!("\n== VERIFY OK: exit {code:?}, no encoding errors ==");
+            return 0;
+        }
+        println!("\n== VERIFY FAILED: exit {code:?} ==");
+        for failure in &failures {
+            println!("  {failure}");
+        }
+        println!("\nchild env: PYTHONIOENCODING={:?} PYTHONUTF8={:?}",
+            std::env::var("PYTHONIOENCODING").ok(),
+            std::env::var("PYTHONUTF8").ok());
+        return 1;
+    }
+
+    println!("\n== running (inherited stdio) ==\n");
+
+    let status = runtime::build_command(&launch)
+        .args(&args)
+        .current_dir(&launch.cwd)
+        .status();
+
+    match status {
+        Ok(status) => {
+            println!("\n== exit code: {:?} ==", status.code());
+            println!("urls: {urls:?}");
+            status.code().unwrap_or(1)
+        }
+        Err(error) => {
+            eprintln!("failed to run: {error}");
+            1
+        }
+    }
+}
+
+/// Headless update check: `yuki --check-updates`.
+///
+/// Exercises the real GitHub path without opening the GUI, so the updater can
+/// be verified in CI or from a terminal.
+fn run_check_updates() -> i32 {
+    let config = settings::diagnose_config_dir();
+    let settings_value = settings::load_for_diagnose();
+    let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+
+    println!("== Yuki update check ==");
+    println!("managed dir : {}", config.display());
+    println!("proxy       : {}", proxy.clone().unwrap_or_else(|| "none".into()));
+
+    let runtime_info = runtime::info_with(Some(&config));
+    println!("current     : {:?}", runtime_info.ytdlp_version);
+    println!("mode        : {}", runtime_info.mode);
+
+    let check = update::check_ytdlp(&config, runtime_info.ytdlp_version.as_deref(), proxy.as_deref());
+    println!("\nyt-dlp");
+    println!("  current   : {:?}", check.current_version);
+    println!("  latest    : {:?}", check.latest_version);
+    println!("  available : {}", check.update_available);
+    println!("  asset     : {:?} ({:?} bytes)", check.asset_name, check.asset_size);
+    if let Some(error) = &check.error {
+        println!("  error     : {error}");
+    }
+
+    let ffmpeg = update::check_ffmpeg(
+        &config,
+        deps::ffmpeg_status().version.as_deref(),
+        proxy.as_deref(),
+    );
+    println!("\nffmpeg");
+    println!("  current   : {:?}", ffmpeg.current_version);
+    println!("  latest    : {:?}", ffmpeg.latest_version);
+    println!("  available : {}", ffmpeg.update_available);
+    println!("  asset     : {:?} ({:?} bytes)", ffmpeg.asset_name, ffmpeg.asset_size);
+    if let Some(error) = &ffmpeg.error {
+        println!("  error     : {error}");
+    }
+
+    if check.error.is_some() || ffmpeg.error.is_some() {
+        println!("\n== CHECK HAD ERRORS ==");
+        return 1;
+    }
+    println!("\n== CHECK OK ==");
+    0
+}
+
+/// Headless install: `yuki --install-ytdlp`.
+///
+/// Verifies the whole update path end to end — download, checksum, atomic swap
+/// — without the GUI.
+fn run_install_ytdlp() -> i32 {
+    let config = settings::diagnose_config_dir();
+    let settings_value = settings::load_for_diagnose();
+    let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    println!("== Yuki: install latest yt-dlp ==");
+    println!("target: {}", update::managed_ytdlp_path(&config).display());
+    println!("proxy : {}", proxy.clone().unwrap_or_else(|| "none".into()));
+
+    let mut last = std::time::Instant::now();
+    let mut progress = |written: u64, total: Option<u64>| {
+        if last.elapsed().as_millis() >= 500 {
+            last = std::time::Instant::now();
+            match total {
+                Some(total) if total > 0 => println!(
+                    "  {:.1}% ({}/{} bytes)",
+                    (written as f64 / total as f64) * 100.0,
+                    written,
+                    total
+                ),
+                _ => println!("  {written} bytes"),
+            }
+        }
+    };
+
+    match update::install_ytdlp(&config, proxy.as_deref(), &mut progress) {
+        Ok(report) => {
+            println!("\ninstalled version : {}", report.version);
+            println!("path              : {}", report.path);
+            println!("bytes             : {}", report.bytes);
+
+            // Prove the freshly installed binary actually runs.
+            let info = runtime::info_with(Some(&config));
+            println!("\nresolved mode     : {}", info.mode);
+            println!("resolved runner   : {}", info.runner);
+            println!("resolved version  : {:?}", info.ytdlp_version);
+
+            if info.mode == "managed" && info.ytdlp_version.is_some() {
+                println!("\n== INSTALL OK ==");
+                0
+            } else {
+                println!("\n== INSTALLED BUT NOT RESOLVED ==");
+                1
+            }
+        }
+        Err(error) => {
+            eprintln!("\n== INSTALL FAILED: {error} ==");
+            1
+        }
+    }
+}
+
+/// Headless FFmpeg install: `yuki --install-ffmpeg`.
+fn run_install_ffmpeg() -> i32 {
+    let config = settings::diagnose_config_dir();
+    let settings_value = settings::load_for_diagnose();
+    let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+
+    println!("== Yuki: install managed FFmpeg ==");
+    println!("target: {}", update::managed_ffmpeg_dir(&config).display());
+    println!("proxy : {}", proxy.clone().unwrap_or_else(|| "none".into()));
+
+    let mut last = std::time::Instant::now();
+    let mut progress = |written: u64, total: Option<u64>| {
+        if last.elapsed().as_millis() >= 1000 {
+            last = std::time::Instant::now();
+            match total {
+                Some(total) if total > 0 => println!(
+                    "  {:.1}% ({:.1}/{:.1} MB)",
+                    (written as f64 / total as f64) * 100.0,
+                    written as f64 / 1_048_576.0,
+                    total as f64 / 1_048_576.0
+                ),
+                _ => println!("  {:.1} MB", written as f64 / 1_048_576.0),
+            }
+        }
+    };
+
+    match update::install_ffmpeg(&config, proxy.as_deref(), &mut progress) {
+        Ok(report) => {
+            println!("\ninstalled version : {}", report.version);
+            println!("path              : {}", report.path);
+            println!("bytes             : {}", report.bytes);
+            println!("usable            : {}", update::usable_ffmpeg_dir(&config).is_some());
+
+            // Prove the managed directory satisfies yt-dlp's expectations: it
+            // must contain ffmpeg, and ffprobe alongside it.
+            let dir = update::usable_ffmpeg_dir(&config).unwrap_or_else(|| update::managed_ffmpeg_dir(&config));
+            for name in if cfg!(windows) { ["ffmpeg.exe", "ffprobe.exe"] } else { ["ffmpeg", "ffprobe"] } {
+                let candidate = dir.join(name);
+                println!("  {name:<12} {}", if candidate.is_file() { "present" } else { "MISSING" });
+            }
+
+            if update::usable_ffmpeg_dir(&config).is_some() {
+                println!("\n== FFMPEG INSTALL OK ==");
+                0
+            } else {
+                println!("\n== FFMPEG INSTALL INCOMPLETE ==");
+                1
+            }
+        }
+        Err(error) => {
+            eprintln!("\n== FFMPEG INSTALL FAILED: {error} ==");
+            1
+        }
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Headless diagnostics: `yuki --diagnose <url>` / `yuki --check-updates`.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.iter().any(|arg| arg == "--install-ffmpeg") {
+        std::process::exit(run_install_ffmpeg());
+    }
+    if argv.iter().any(|arg| arg == "--install-ytdlp") {
+        std::process::exit(run_install_ytdlp());
+    }
+    if argv.iter().any(|arg| arg == "--check-updates") {
+        std::process::exit(run_check_updates());
+    }
+    if let Some(index) = argv.iter().position(|arg| arg == "--diagnose") {
+        let url = argv.get(index + 1).cloned().unwrap_or_default();
+        if url.is_empty() {
+            eprintln!("usage: yuki --diagnose <url>");
+            std::process::exit(2);
+        }
+        std::process::exit(run_diagnose(&url));
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::default())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            if let Ok(dir) = app.path().resource_dir() { runtime::set_resource_dir(dir); }
+            let handle = app.handle().clone();
+            let manager = Arc::new(DownloadManager::new(handle.clone()));
+            let _ = APP_HANDLE.set(handle);
+            app.manage(manager);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            analyze_url,
+            get_settings,
+            save_settings,
             runtime_info,
+            check_updates,
+            install_ytdlp_update,
+            install_ffmpeg_update,
             check_ffmpeg,
             install_ffmpeg,
             list_tasks,
-            get_task,
+            get_history,
             start_download,
-            cancel_task
+            retry_task,
+            pause_task,
+            resume_task,
+            cancel_task,
+            remove_task,
+            clear_finished,
+            reveal_path,
+            copy_diagnostics
         ])
         .run(tauri::generate_context!())
-        .expect("error while running yt-dlp Studio");
+        .expect("error while running Yuki");
 }

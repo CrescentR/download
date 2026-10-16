@@ -1,650 +1,300 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
-import { createIcons, icons } from "lucide";
-import thumbCourse from "./assets/thumb-course.png";
-import thumbArchitecture from "./assets/thumb-architecture.png";
+import { createStore, storage, throttleFrame } from "./core/util.js";
+import { resolveLanguage, setLanguage, t } from "./core/i18n.js";
+import { call, isDesktop, on } from "./core/api.js";
+import { mountShell, render } from "./ui/shell.js";
+import { configure, installActions, applyTheme, patchHistoryHint } from "./ui/actions.js";
+import { toast } from "./ui/toasts.js";
 import "./styles.css";
 
-const isTauri = () => Boolean(window.__TAURI_INTERNALS__);
-const $ = (selector) => document.querySelector(selector);
-
-const i18n = {
-  zh: {
-    appName: "StreamFlow",
-    queue: "队列",
-    library: "库",
-    completed: "已完成",
-    pasteUrl: "粘贴 URL",
-    downloadTop: "下载",
-    urlPlaceholder: "粘贴或解析 URL...",
-    activeDownloads: "活动下载",
-    completedDownloads: "已完成下载",
-    libraryTitle: "下载库",
-    emptyQueue: "还没有下载任务。粘贴一个链接开始。",
-    path: "路径",
-    total: "总计",
-    powered: "由 yt-dlp 驱动",
-    language: "EN",
-    downloading: "下载中",
-    queued: "排队中",
-    completedStatus: "已完成",
-    failed: "失败",
-    canceled: "已取消",
-    noItems: "暂无内容",
-    chooseFolder: "选择下载目录",
-    pasteBlocked: "无法读取剪贴板，请手动粘贴链接",
-    needUrl: "请先输入一个 URL",
-    started: "下载任务已创建",
-    previewOnly: "预览模式下不会启动真实下载",
-    allTasks: "全部任务会显示在这里",
-    quality: "清晰度",
-    ffmpegReady: "FFmpeg 已就绪",
-    ffmpegMissing: "需要 FFmpeg 才能合并音视频、转换格式、提取音频、嵌入封面/字幕。",
-    ffmpegInstall: "安装 FFmpeg",
-    ffmpegInstalling: "正在安装...",
-    ffmpegRecheck: "重新检测",
-    ffmpegManual: "查看引导",
-    ffmpegPreview: "桌面应用中会自动检测 FFmpeg。",
-    ffmpegInstallStarted: "正在打开 FFmpeg 安装终端...",
-    ffmpegInstallDone: "安装器已打开。完成安装后请点击重新检测。",
-    ffmpegInstallFailed: "安装未完成，请按引导手动安装",
-    ffmpegCopyCommand: "复制命令",
-    copied: "已复制",
-    settingsTitle: "设置",
-    settingsSubtitle: "管理下载、语言、运行环境和依赖",
-    downloadPath: "下载路径",
-    choosePath: "选择路径",
-    defaultQuality: "默认清晰度",
-    appLanguage: "界面语言",
-    dependencies: "依赖环境",
-    runtimeSource: "运行源",
-    platform: "平台",
-    packageManager: "包管理器",
-    installCommand: "安装命令",
-    close: "关闭",
-    pathSaved: "下载路径已更新",
-  },
-  en: {
-    appName: "StreamFlow",
-    queue: "Queue",
-    library: "Library",
-    completed: "Completed",
-    pasteUrl: "Paste URL",
-    downloadTop: "Download",
-    urlPlaceholder: "Paste & Analyze URL...",
-    activeDownloads: "Active Downloads",
-    completedDownloads: "Completed Downloads",
-    libraryTitle: "Library",
-    emptyQueue: "No downloads yet. Paste a link to begin.",
-    path: "Path",
-    total: "Total",
-    powered: "Powered by yt-dlp",
-    language: "中文",
-    downloading: "Downloading",
-    queued: "Queued",
-    completedStatus: "Completed",
-    failed: "Failed",
-    canceled: "Canceled",
-    noItems: "Nothing here yet",
-    chooseFolder: "Choose download folder",
-    pasteBlocked: "Clipboard access failed. Paste the URL manually.",
-    needUrl: "Enter a URL first",
-    started: "Download created",
-    previewOnly: "Preview mode does not start real downloads",
-    allTasks: "All tasks will appear here",
-    quality: "Quality",
-    ffmpegReady: "FFmpeg ready",
-    ffmpegMissing: "FFmpeg is required for stream merging, format conversion, audio extraction, thumbnails, and subtitles.",
-    ffmpegInstall: "Install FFmpeg",
-    ffmpegInstalling: "Installing...",
-    ffmpegRecheck: "Recheck",
-    ffmpegManual: "Show guide",
-    ffmpegPreview: "The desktop app will detect FFmpeg automatically.",
-    ffmpegInstallStarted: "Opening FFmpeg installer terminal...",
-    ffmpegInstallDone: "Installer opened. Click Recheck after it finishes.",
-    ffmpegInstallFailed: "Install did not complete. Follow the guide to install manually.",
-    ffmpegCopyCommand: "Copy command",
-    copied: "Copied",
-    settingsTitle: "Settings",
-    settingsSubtitle: "Manage downloads, language, runtime, and dependencies",
-    downloadPath: "Download path",
-    choosePath: "Choose path",
-    defaultQuality: "Default quality",
-    appLanguage: "Language",
-    dependencies: "Dependencies",
-    runtimeSource: "Runtime source",
-    platform: "Platform",
-    packageManager: "Package manager",
-    installCommand: "Install command",
-    close: "Close",
-    pathSaved: "Download path updated",
-  },
-};
-
-const demoTasks = [
-  {
-    id: "demo-course",
-    title: "Modern Web Design Trends 2024 - Complete Guide",
-    status: "running",
-    progress: 85,
-    speed: "4.2 MB/s",
-    size: "150MB",
-    downloaded: "124MB",
-    duration: "17:48",
-    thumbnail: thumbCourse,
-    logs: [],
-    urls: ["https://example.com/web-design"],
-    command: ["yt-dlp", "https://example.com/web-design"],
-  },
-  {
-    id: "demo-architecture",
-    title: "Advanced Next.js Architecture Patterns",
-    status: "queued",
-    progress: 0,
-    speed: "",
-    size: "850MB",
-    downloaded: "0MB",
-    duration: "45:20",
-    thumbnail: thumbArchitecture,
-    logs: [],
-    urls: ["https://example.com/nextjs"],
-    command: ["yt-dlp", "https://example.com/nextjs"],
-  },
-];
-
-const state = {
-  lang: localStorage.getItem("streamflow-lang") || (navigator.language.startsWith("zh") ? "zh" : "en"),
+const store = createStore({
+  desktop: isDesktop(),
   tab: "queue",
+  taskFilter: "all",
+  commandQuality: "2160",
+  parserOptions: {},
   tasks: [],
-  outputDir: localStorage.getItem("streamflow-output-dir") || "C:/Users/Downloads/StreamFlow",
-  quality: localStorage.getItem("streamflow-quality") || "1080p MP4",
+  probe: null,
+  probeUrl: null,
+  analyzing: false,
+  selectedFormatId: "",
+  drawerTaskId: null,
+  settingsOpen: false,
+  settingsSaving: false,
+  settings: {
+    outputDir: "",
+    outputTemplate: "",
+    quality: "best",
+    theme: storage.get("yuki-theme", "dark"),
+    language: "",
+    playlistMode: "auto",
+    clipboardWatch: true,
+    embedMetadata: true,
+  },
+  language: "zh",
+  theme: storage.get("yuki-theme", "dark"),
   ffmpeg: null,
   installingFfmpeg: false,
-  settingsOpen: false,
   runtime: null,
-};
+  updates: {},
+  checkingUpdates: false,
+  updating: null,
+  updateProgress: null,
+});
 
-function t(key) {
-  return i18n[state.lang][key] || key;
-}
-
-async function call(command, args) {
-  if (isTauri()) return invoke(command, args);
-  if (command === "runtime_info") return { repoRoot: "D:/MyCode/yt-dlp" };
-  if (command === "list_tasks") return [];
-  if (command === "get_task") return null;
-  if (command === "check_ffmpeg") {
-    return {
-      installed: false,
-      version: null,
-      path: null,
-      installSupported: false,
-      installCommand: null,
-      guidance: t("ffmpegPreview"),
-    };
-  }
-  throw new Error(t("previewOnly"));
-}
-
-function statusText(status) {
-  return {
-    running: t("downloading"),
-    queued: t("queued"),
-    completed: t("completedStatus"),
-    failed: t("failed"),
-    canceled: t("canceled"),
-  }[status] || status;
-}
-
-function progressOf(task) {
-  if (typeof task.progress === "number") return Math.max(0, Math.min(100, task.progress));
-  return task.status === "completed" ? 100 : 0;
-}
-
-function activeTasks() {
-  const real = state.tasks.filter((task) => ["running", "queued"].includes(task.status));
-  if (!isTauri() && real.length === 0 && state.tab === "queue") return demoTasks;
-  return real;
-}
-
-function visibleTasks() {
-  if (state.tab === "completed") return state.tasks.filter((task) => task.status === "completed");
-  if (state.tab === "library") return state.tasks;
-  return activeTasks();
-}
-
-function taskTitle(task) {
-  return task.title || task.urls?.[0] || "Untitled";
-}
-
-function taskThumb(task, index) {
-  return task.thumbnail || (index % 2 === 0 ? thumbCourse : thumbArchitecture);
-}
-
-function render() {
-  const tasks = visibleTasks();
-  document.querySelector("#app").innerHTML = `
-    <main class="stream-shell ${shouldShowFfmpegBanner() ? "has-ffmpeg-banner" : ""}">
-      <header class="top-nav">
-        <div class="brand">${t("appName")}</div>
-        <nav class="tabs" aria-label="Download sections">
-          ${["queue", "library", "completed"].map((tab) => `
-            <button class="tab ${state.tab === tab ? "active" : ""}" data-tab="${tab}" type="button">${t(tab)}</button>
-          `).join("")}
-        </nav>
-        <div class="header-actions">
-          <button class="soft-action" id="pasteButton" type="button"><i data-lucide="clipboard"></i>${t("pasteUrl")}</button>
-          <button class="primary-action small" id="headerDownload" type="button"><i data-lucide="download"></i>${t("downloadTop")}</button>
-          <button class="icon-action" id="languageButton" type="button" title="Language"><i data-lucide="globe-2"></i><span>${t("language")}</span></button>
-          <button class="icon-only" type="button" title="Notifications"><i data-lucide="bell"></i></button>
-          <button class="icon-only" id="settingsButton" type="button" title="${t("settingsTitle")}"><i data-lucide="settings"></i></button>
-        </div>
-      </header>
-
-      ${renderFfmpegBanner()}
-
-      <section class="download-bar">
-        <input id="urlInput" type="text" placeholder="${t("urlPlaceholder")}" spellcheck="false" />
-        <label class="quality-select" aria-label="${t("quality")}">
-          <select id="qualitySelect">
-            <option ${state.quality === "1080p MP4" ? "selected" : ""}>1080p MP4</option>
-            <option ${state.quality === "720p MP4" ? "selected" : ""}>720p MP4</option>
-            <option ${state.quality === "Audio MP3" ? "selected" : ""}>Audio MP3</option>
-            <option ${state.quality === "Best" ? "selected" : ""}>Best</option>
-          </select>
-        </label>
-        <button class="download-button" id="downloadButton" type="button">${t("downloadTop")}</button>
-      </section>
-
-      <section class="content">
-        <h1>${state.tab === "completed" ? t("completedDownloads") : state.tab === "library" ? t("libraryTitle") : t("activeDownloads")}</h1>
-        <div class="download-list">
-          ${tasks.length ? tasks.map(renderTask).join("") : renderEmpty()}
-        </div>
-      </section>
-
-      <footer class="status-bar">
-        <button class="path-button" id="pathButton" type="button"><i data-lucide="folder"></i>${t("path")}: ${state.outputDir}</button>
-        <div class="total"><i data-lucide="shield-check"></i>${t("total")}: ${totalSize(tasks)}</div>
-        <div class="credit">© 2024 StreamFlow Desktop. ${t("powered")}.</div>
-        <button class="footer-gear" id="footerSettings" type="button"><i data-lucide="settings"></i></button>
-      </footer>
-
-      ${renderSettings()}
-    </main>
-
-    <div class="toast" id="toast" role="status" aria-live="polite"></div>
-  `;
-
-  createIcons({ icons });
-  bindEvents();
-}
-
-function shouldShowFfmpegBanner() {
-  return state.ffmpeg && !state.ffmpeg.installed;
-}
-
-function renderFfmpegBanner() {
-  if (!shouldShowFfmpegBanner()) return "";
-  const installLabel = state.installingFfmpeg ? t("ffmpegInstalling") : ffmpegActionLabel();
-  const guidance = escapeHtml(ffmpegGuidance());
-  return `
-    <section class="ffmpeg-banner">
-      <div class="ffmpeg-copy">
-        <i data-lucide="triangle-alert"></i>
-        <div>
-          <strong>${t("ffmpegMissing")}</strong>
-          <span>${guidance}</span>
-        </div>
-      </div>
-      <div class="ffmpeg-actions">
-        <button class="soft-action" id="recheckFfmpeg" type="button">${t("ffmpegRecheck")}</button>
-        <button class="download-button install" id="installFfmpeg" type="button" ${ffmpegActionDisabled() ? "disabled" : ""}>${installLabel}</button>
-      </div>
-    </section>
-  `;
-}
-
-function renderSettings() {
-  if (!state.settingsOpen) return "";
-  const command = state.ffmpeg?.installCommand || "";
-  const runtime = state.runtime || {};
-  return `
-    <section class="settings-scrim" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
-      <div class="settings-panel">
-        <header class="settings-head">
-          <div>
-            <h2 id="settingsTitle">${t("settingsTitle")}</h2>
-            <p>${t("settingsSubtitle")}</p>
-          </div>
-          <button class="icon-only" id="closeSettings" type="button" title="${t("close")}"><i data-lucide="x"></i></button>
-        </header>
-
-        <div class="settings-body">
-          <section class="settings-section">
-            <h3>${t("downloadPath")}</h3>
-            <div class="setting-row path-row">
-              <input id="settingsOutputDir" value="${escapeHtml(state.outputDir)}" readonly />
-              <button class="soft-action" id="settingsChoosePath" type="button">${t("choosePath")}</button>
-            </div>
-          </section>
-
-          <section class="settings-section">
-            <h3>${t("defaultQuality")}</h3>
-            <select id="settingsQuality">
-              <option ${state.quality === "1080p MP4" ? "selected" : ""}>1080p MP4</option>
-              <option ${state.quality === "720p MP4" ? "selected" : ""}>720p MP4</option>
-              <option ${state.quality === "Audio MP3" ? "selected" : ""}>Audio MP3</option>
-              <option ${state.quality === "Best" ? "selected" : ""}>Best</option>
-            </select>
-          </section>
-
-          <section class="settings-section">
-            <h3>${t("appLanguage")}</h3>
-            <div class="segmented-setting">
-              <button class="${state.lang === "zh" ? "active" : ""}" data-lang="zh" type="button">中文</button>
-              <button class="${state.lang === "en" ? "active" : ""}" data-lang="en" type="button">English</button>
-            </div>
-          </section>
-
-          <section class="settings-section">
-            <h3>${t("dependencies")}</h3>
-            <div class="dependency-card ${state.ffmpeg?.installed ? "ok" : "missing"}">
-              <div>
-                <strong>${state.ffmpeg?.installed ? t("ffmpegReady") : t("ffmpegMissing")}</strong>
-                <span>${escapeHtml(state.ffmpeg?.version || ffmpegGuidance())}</span>
-              </div>
-              <div class="dependency-actions">
-                <button class="soft-action" id="settingsRecheckFfmpeg" type="button">${t("ffmpegRecheck")}</button>
-                ${state.ffmpeg?.installed ? "" : `<button class="download-button install" id="settingsInstallFfmpeg" type="button" ${ffmpegActionDisabled() ? "disabled" : ""}>${ffmpegActionLabel()}</button>`}
-              </div>
-            </div>
-            <dl class="settings-meta">
-              <div><dt>${t("platform")}</dt><dd>${escapeHtml(state.ffmpeg?.platform || "-")}</dd></div>
-              <div><dt>${t("packageManager")}</dt><dd>${escapeHtml(state.ffmpeg?.packageManager || "-")}</dd></div>
-              <div><dt>${t("installCommand")}</dt><dd>${escapeHtml(command || "-")}</dd></div>
-            </dl>
-          </section>
-
-          <section class="settings-section">
-            <h3>${t("runtimeSource")}</h3>
-            <dl class="settings-meta">
-              <div><dt>Mode</dt><dd>${escapeHtml(runtime.mode || "-")}</dd></div>
-              <div><dt>Runner</dt><dd>${escapeHtml(runtime.runner || "-")}</dd></div>
-              <div><dt>Root</dt><dd>${escapeHtml(runtime.repoRoot || "-")}</dd></div>
-            </dl>
-          </section>
-        </div>
-      </div>
-    </section>
-  `;
-}
-
-function ffmpegActionLabel() {
-  if (state.ffmpeg?.installSupported) return t("ffmpegInstall");
-  if (state.ffmpeg?.installCommand) return t("ffmpegCopyCommand");
-  return t("ffmpegManual");
-}
-
-function ffmpegActionDisabled() {
-  return state.installingFfmpeg;
-}
-
-function ffmpegGuidance() {
-  if (!isTauri()) return t("ffmpegPreview");
-  if (state.ffmpeg?.installSupported) {
-    const command = state.ffmpeg.installCommand ? ` (${state.ffmpeg.installCommand})` : "";
-    return state.lang === "zh"
-      ? `可通过系统包管理器安装${command}。安装后如果仍提示缺失，请重启 StreamFlow。`
-      : `StreamFlow can install FFmpeg with your system package manager${command}. Restart StreamFlow if PATH is not refreshed.`;
-  }
-  return state.ffmpeg?.guidance || t("ffmpegMissing");
-}
-
-function renderTask(task, index) {
-  const progress = progressOf(task);
-  const downloaded = task.downloaded || (task.size && progress ? `${Math.round(progress)}%` : "0MB");
-  return `
-    <article class="download-card ${task.status}" data-task-id="${task.id}">
-      <div class="thumbnail-wrap">
-        <img src="${taskThumb(task, index)}" alt="" />
-        <span class="duration">${task.duration || "00:00"}</span>
-      </div>
-      <div class="download-info">
-        <div class="download-title-row">
-          <h2>${escapeHtml(taskTitle(task))}</h2>
-          <span class="speed">${task.speed || ""}</span>
-          <span class="size">${downloaded} / ${task.size || "0MB"}</span>
-        </div>
-        <div class="download-state">${statusText(task.status)}</div>
-        <div class="progress-track">
-          <span style="width:${progress}%"></span>
-        </div>
-      </div>
-    </article>
-  `;
-}
-
-function renderEmpty() {
-  return `
-    <div class="empty-panel">
-      <i data-lucide="loader-2"></i>
-      <strong>${state.tab === "queue" ? t("emptyQueue") : t("noItems")}</strong>
-      <span>${t("allTasks")}</span>
-    </div>
-  `;
-}
-
-function totalSize(tasks) {
-  if (!tasks.length) return "0 MB";
-  if (!isTauri() && state.tab === "queue") return "12.5 MB/s";
-  return `${tasks.length} ${state.lang === "zh" ? "项" : "items"}`;
-}
-
-function bindEvents() {
-  document.querySelectorAll("[data-tab]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.tab = button.dataset.tab;
-      render();
-    });
-  });
-  $("#languageButton").addEventListener("click", () => {
-    state.lang = state.lang === "zh" ? "en" : "zh";
-    localStorage.setItem("streamflow-lang", state.lang);
-    render();
-  });
-  $("#qualitySelect").addEventListener("change", (event) => {
-    state.quality = event.target.value;
-    localStorage.setItem("streamflow-quality", state.quality);
-  });
-  $("#pasteButton").addEventListener("click", pasteUrl);
-  $("#headerDownload").addEventListener("click", startDownload);
-  $("#downloadButton").addEventListener("click", startDownload);
-  $("#settingsButton").addEventListener("click", openSettings);
-  $("#pathButton").addEventListener("click", chooseFolder);
-  $("#footerSettings").addEventListener("click", openSettings);
-  $("#recheckFfmpeg")?.addEventListener("click", refreshFfmpeg);
-  $("#installFfmpeg")?.addEventListener("click", installFfmpeg);
-  $("#closeSettings")?.addEventListener("click", closeSettings);
-  $("#settingsChoosePath")?.addEventListener("click", chooseFolder);
-  $("#settingsRecheckFfmpeg")?.addEventListener("click", refreshFfmpeg);
-  $("#settingsInstallFfmpeg")?.addEventListener("click", installFfmpeg);
-  $("#settingsQuality")?.addEventListener("change", (event) => {
-    state.quality = event.target.value;
-    localStorage.setItem("streamflow-quality", state.quality);
-    render();
-  });
-  document.querySelectorAll("[data-lang]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.lang = button.dataset.lang;
-      localStorage.setItem("streamflow-lang", state.lang);
-      render();
-    });
-  });
-}
-
-async function openSettings() {
-  state.settingsOpen = true;
-  await refreshRuntime(false);
-  render();
-}
-
-function closeSettings() {
-  state.settingsOpen = false;
-  render();
-}
-
-async function pasteUrl() {
-  try {
-    $("#urlInput").value = await navigator.clipboard.readText();
-  } catch {
-    toast(t("pasteBlocked"));
-  }
-}
-
-function qualityPayload() {
-  if (state.quality === "Audio MP3") return { formatPreset: "audio", audioFormat: "mp3", customFormat: "" };
-  if (state.quality === "Best") return { formatPreset: "best", audioFormat: "mp3", customFormat: "" };
-  return { formatPreset: "mp4", audioFormat: "mp3", customFormat: "" };
-}
-
-async function startDownload() {
-  const url = $("#urlInput").value.trim();
-  if (!url) {
-    toast(t("needUrl"));
-    return;
-  }
-  const quality = qualityPayload();
-  const payload = {
-    urls: [url],
-    outputDir: state.outputDir,
-    outputTemplate: "%(title).180B [%(id)s].%(ext)s",
-    playlistMode: "auto",
-    embedMetadata: true,
-    embedThumbnail: false,
-    writeSubtitles: false,
-    writeAutoSubtitles: false,
-    embedSubtitles: false,
-    writeInfoJson: false,
-    subtitleLangs: "",
-    cookiesBrowser: "",
-    rateLimit: "",
-    concurrentFragments: "",
-    proxy: "",
-    downloadArchive: "",
-    retries: "",
-    customArgs: [],
-    ...quality,
-  };
-  try {
-    await call("start_download", { payload });
-    $("#urlInput").value = "";
-    toast(t("started"));
-    await refreshTasks();
-  } catch (error) {
-    toast(String(error));
-  }
-}
-
-async function chooseFolder() {
-  if (!isTauri()) {
-    toast(t("chooseFolder"));
-    return;
-  }
-  const selected = await open({ directory: true, multiple: false, title: t("chooseFolder") });
-  if (selected) {
-    state.outputDir = selected;
-    localStorage.setItem("streamflow-output-dir", state.outputDir);
-    toast(t("pathSaved"));
-    render();
-  }
-}
-
-async function refreshRuntime(shouldRender = true) {
-  try {
-    state.runtime = await call("runtime_info");
-    if (shouldRender) render();
-  } catch {
-    state.runtime = null;
-  }
-}
+// Coalesce renders to one per frame: progress events can arrive faster than
+// the display refreshes, and rendering more often than that is wasted work.
+const scheduleRender = throttleFrame(() => render(store.get()));
 
 async function refreshTasks() {
   try {
-    state.tasks = await call("list_tasks");
-    render();
+    const tasks = await call("list_tasks");
+    store.set({ tasks: Array.isArray(tasks) ? tasks : [] });
   } catch {
-    render();
+    store.set({ tasks: [] });
   }
+  scheduleRender();
 }
 
-async function refreshFfmpeg() {
+async function loadSettings() {
   try {
-    state.ffmpeg = await call("check_ffmpeg");
-    render();
-  } catch (error) {
-    toast(String(error));
+    const loaded = await call("get_settings");
+    store.set({ settings: loaded });
+  } catch {
+    /* backend unavailable: keep whatever the preview/local defaults are */
   }
 }
 
-async function installFfmpeg() {
-  if (!isTauri()) {
-    toast(t("ffmpegPreview"));
-    return;
-  }
-  if (!state.ffmpeg?.installSupported && state.ffmpeg?.installCommand) {
-    await navigator.clipboard.writeText(state.ffmpeg.installCommand);
-    toast(t("copied"));
-    return;
-  }
-  if (!state.ffmpeg?.installSupported) {
-    toast(state.ffmpeg?.guidance || t("ffmpegMissing"));
-    return;
-  }
-  try {
-    state.installingFfmpeg = true;
-    render();
-    toast(t("ffmpegInstallStarted"));
-    const result = await invoke("install_ffmpeg");
-    state.ffmpeg = result.status;
-    toast(result.success ? t("ffmpegInstallDone") : `${t("ffmpegInstallFailed")}: ${result.message}`);
-  } catch (error) {
-    toast(`${t("ffmpegInstallFailed")}: ${String(error)}`);
-  } finally {
-    state.installingFfmpeg = false;
-    render();
-  }
+/**
+ * Resolve the starting theme and language.
+ *
+ * The backend config is the durable source of truth, but `localStorage` is the
+ * only thing available before the backend answers. A stored choice therefore
+ * wins, and is written back so the two cannot drift apart.
+ */
+function resolvePresentation(settings) {
+  const storedTheme = storage.get("yuki-theme", null);
+  const theme = storedTheme === "light" || storedTheme === "dark"
+    ? storedTheme
+    : settings?.theme === "light"
+      ? "light"
+      : "dark";
+
+  const language = settings?.language === "zh" || settings?.language === "en"
+    ? settings.language
+    : resolveLanguage(settings?.language);
+
+  return { theme, language };
 }
 
-function toast(message) {
-  const node = $("#toast");
-  node.textContent = message;
-  node.classList.add("show");
-  clearTimeout(toast.timer);
-  toast.timer = setTimeout(() => node.classList.remove("show"), 3600);
+async function loadEnvironment() {
+  const [runtime, ffmpeg] = await Promise.all([
+    call("runtime_info").catch(() => null),
+    call("check_ffmpeg").catch(() => null),
+  ]);
+  store.set({ runtime, ffmpeg });
 }
 
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (match) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    "\"": "&quot;",
-    "'": "&#039;",
-  }[match]));
+/** Check independently of rendering; a failed check never implies up to date. */
+async function loadUpdates() {
+  if (!isDesktop()) return;
+  store.set({ checkingUpdates: true });
+  scheduleRender();
+  await Promise.all(["ytdlp", "ffmpeg"].map(async (component) => {
+    try {
+      const info = await call("check_updates", { component });
+      store.set({ updates: { ...store.get().updates, [component]: info } });
+    } catch (error) {
+      store.set({ updates: { ...store.get().updates, [component]: { error: String(error) } } });
+    }
+    scheduleRender();
+  }));
+  store.set({ checkingUpdates: false });
+  scheduleRender();
 }
 
-if (isTauri()) {
-  listen("task-updated", (event) => {
+/** Subscribe to backend task events. */
+async function attachTaskEvents() {
+  if (!isDesktop()) return;
+
+  await on("task-updated", (event) => {
     const task = event.payload;
-    const index = state.tasks.findIndex((item) => item.id === task.id);
-    if (index >= 0) state.tasks[index] = task;
-    else state.tasks.unshift(task);
-    render();
+    if (!task?.id) return;
+    // A synthetic "removed" marker is emitted when a task is deleted.
+    if (task.status === "removed") return;
+
+    const tasks = store.get().tasks.slice();
+    const index = tasks.findIndex((item) => item.id === task.id);
+    if (index >= 0) tasks[index] = task;
+    else tasks.unshift(task);
+    store.set({ tasks });
+    scheduleRender();
+  });
+
+  await on("task-log", (event) => {
+    const { id, line } = event.payload || {};
+    if (!id || !line) return;
+    // Log lines only matter to the open drawer; patch that task's buffer
+    // without disturbing anything else.
+    const tasks = store.get().tasks.slice();
+    const index = tasks.findIndex((item) => item.id === id);
+    if (index < 0) return;
+    const task = { ...tasks[index] };
+    const logs = task.logs ? task.logs.slice(-499) : [];
+    logs.push(line);
+    task.logs = logs;
+    tasks[index] = task;
+    store.set({ tasks });
+    if (store.get().drawerTaskId === id) scheduleRender();
+  });
+
+  await on("task-removed", (event) => {
+    const id = event.payload?.id;
+    if (!id) return;
+    const tasks = store.get().tasks.filter((item) => item.id !== id);
+    const next = { tasks };
+    if (store.get().drawerTaskId === id) next.drawerTaskId = null;
+    store.set(next);
+    scheduleRender();
+  });
+
+  await on("tasks-cleared", (event) => {
+    const ids = new Set(event?.payload?.ids || []);
+    const tasks = store.get().tasks.filter((task) => !ids.has(task.id));
+    const next = { tasks };
+    if (ids.has(store.get().drawerTaskId)) next.drawerTaskId = null;
+    store.set(next);
+    scheduleRender();
+  });
+
+  await on("update-progress", (event) => {
+    store.set({ updateProgress: event.payload || null });
+    scheduleRender();
   });
 }
 
-render();
-refreshFfmpeg();
-refreshTasks();
+/**
+ * Poll the task list while anything is active.
+ *
+ * The backend already emits throttled progress events; this poll is a safety
+ * net so a dropped event can never leave the UI stuck on a stale percentage.
+ */
+function startPolling() {
+  if (!isDesktop()) return;
+  setInterval(() => {
+    const active = store.get().tasks.some((task) => ["queued", "running", "merging", "pausing"].includes(task.status));
+    if (active) refreshTasks();
+  }, 2500);
+}
+
+/** Offer to fill the composer when a link is copied. */
+function startClipboardWatch() {
+  if (!isDesktop() || !navigator.clipboard?.readText) return;
+  let last = "";
+  setInterval(async () => {
+    const appState = store.get();
+    if (!appState.settings.clipboardWatch || appState.settingsOpen) return;
+    const input = document.querySelector("[data-url-input]");
+    if (!input || input.value.trim()) return;
+    try {
+      const text = await navigator.clipboard.readText();
+      if (!text || text === last) return;
+      last = text;
+      const match = text.match(/https?:\/\/[^\s<>"']+/i);
+      if (!match) return;
+      input.value = match[0];
+      patchHistoryHint();
+    } catch {
+      /* clipboard permission denied: nothing to do */
+    }
+  }, 1600);
+}
+
+async function boot() {
+  const root = document.querySelector("#app");
+  mountShell(root);
+  applyTheme(store.get().theme);
+  configure({ store, refreshTasks });
+  installActions(root);
+
+  await loadSettings();
+
+  const { theme, language } = resolvePresentation(store.get().settings);
+  applyTheme(theme);
+  setLanguage(language);
+  store.set({ theme, language });
+
+  render(store.get());
+  patchHistoryHint();
+
+  await Promise.all([loadEnvironment(), refreshTasks()]);
+  render(store.get());
+
+  attachTaskEvents();
+  startPolling();
+  startClipboardWatch();
+  void loadUpdates();
+
+  if (!isDesktop()) {
+    // Offline thumbnail artwork for the explicitly labelled browser preview.
+    const thumb = (scene) => `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180" viewBox="0 0 320 180"><rect width="320" height="180" fill="#2a2c2e"/><rect y="112" width="320" height="68" fill="#383b3d"/><path d="${scene===1?'M0 130 96 38 175 109 231 71 320 145V180H0Z':scene===2?'M0 118 55 118 55 53 90 53 90 91 130 91 130 25 176 25 176 80 217 80 217 46 255 46 255 112 320 112V180H0Z':'M0 150 105 58 162 133 241 39 320 155V180H0Z'}" fill="#141719"/><path d="M0 154H320M0 161H320M0 168H320" stroke="#737678" stroke-opacity=".3"/><circle cx="252" cy="42" r="14" fill="#99958b"/></svg>`)}`;
+    store.set({
+      tasks: [
+        {
+          id: "preview-running",
+          urls: ["https://example.com/a"],
+          title: "The quiet art of Japanese architecture",
+          status: "running",
+          quality: "best",
+          outputDir: store.get().settings.outputDir || "C:/Users/Downloads",
+          progress: 62.4,
+          downloadedBytes: 82345678,
+          totalBytes: 132000000,
+          speed: 5242880,
+          eta: 9,
+          duration: 213,
+          thumbnail: thumb(1),
+          command: ["python", "-m", "yt_dlp", "--newline", "https://example.com/a"],
+          logs: [
+            { seq: 1, stream: "stdout", text: "[youtube] Extracting URL: https://example.com/a" },
+            { seq: 2, stream: "stdout", text: "[info] Downloading 1 format(s): 137+140" },
+            { seq: 3, stream: "stdout", text: "[download] Destination: preview.mp4" },
+            { seq: 4, stream: "stdout", text: "[download]  62.4% of 132.00MiB at 5.00MiB/s ETA 00:09" },
+          ],
+          droppedLogs: 0,
+        },
+        {
+          id: "preview-queued",
+          urls: ["https://example.com/b"],
+          title: "A walk through Kyoto, before the city wakes",
+          status: "queued",
+          quality: "1080",
+          outputDir: store.get().settings.outputDir || "C:/Users/Downloads",
+          progress: 0,
+          duration: 742,
+          thumbnail: thumb(2),
+          command: [],
+          logs: [],
+          droppedLogs: 0,
+        },
+        { id: "preview-paused", urls: ["https://www.youtube.com/watch?v=paused"], title: "Designing objects that last — a conversation", status: "paused", quality: "audio", outputDir: "C:/Users/Downloads", progress: 38.7, downloadedBytes: 42598400, totalBytes: 110100480, duration: 1468, thumbnail: thumb(3), logs: [], command: [] },
+        { id: "preview-completed", urls: ["https://vimeo.com/film"], title: "Alpine light · a short film", status: "completed", quality: "2160", outputDir: "C:/Users/Downloads", progress: 100, downloadedBytes: 284164096, totalBytes: 284164096, duration: 322, thumbnail: thumb(1), logs: [], command: [] },
+      ],
+    });
+    render(store.get());
+  }
+
+  if (store.get().ffmpeg && !store.get().ffmpeg.installed) {
+    toast(t("ffmpegMissingHint"), "warning", 5200);
+  }
+}
+
+store.subscribe(() => scheduleRender());
+
+boot().catch((error) => {
+  // Never leave a blank window: surface the failure in the UI.
+  const root = document.querySelector("#app");
+  if (root) {
+    root.innerHTML = `<div style="padding:40px;font-family:system-ui;color:#fb7185">
+      <h2>Yuki failed to start</h2><pre>${String(error?.stack || error)}</pre></div>`;
+  }
+});

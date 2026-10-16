@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    ytdlp_studio_lib::run()
+    yuki_lib::run()
 }
