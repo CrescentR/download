@@ -196,7 +196,8 @@ yt-dlp 会为合并调用 ffmpeg。只杀直接子进程会留下孤立的 ffmpe
 - **yt-dlp**：下载官方 standalone 构建。它们是 PyInstaller 打包、自带 CPython 的版本，**用户无需安装 Python**。刻意不使用无扩展名的 `yt-dlp` 资产，那是 zipimport 构建，依赖系统 Python。
 - **FFmpeg**：下载 BtbN 的 **LGPL shared** 构建，保留构建目录中的 `bin`、`lib` 与许可证文件。选 LGPL 而非 GPL，是因为下载器只需要流拷贝、封装与音频提取，用不到 GPL-only 的 x264/x265，同时保留下载构建随附的许可证与动态库。运行时下载并不自动豁免许可证义务。通过 `--ffmpeg-location <目录>` 指给 yt-dlp；该路径必须真实存在，否则 yt-dlp 会警告并**完全禁用** ffmpeg。
 - **完整性**：yt-dlp 必须通过官方 `SHA2-256SUMS` 校验；FFmpeg 必须通过 GitHub asset SHA-256 digest 或发布校验清单。校验失败不安装。两者先试运行再替换，FFmpeg 整个目录一起切换，失败时恢复旧目录。
-- **代理**：先读设置中的代理，其次读 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 等环境变量。没有直连 GitHub 的机器完全依赖这一点——否则只会得到一个语焉不详的连接超时。
+- **GitHub 加速**：默认使用 [GH-Proxy](https://gh-proxy.com/docs/github-accelerator)，按官方文档将 `https://gh-proxy.com/` 拼在原始 GitHub URL 前。版本 API、发布文件与 SHA-256 校验清单均使用同一配置。在「设置 → 网络与登录 → GitHub 镜像」可替换前缀，留空则关闭加速。新设置和缺少该字段的旧配置均启用默认地址；已有自定义地址或明确留空的选择会保留。
+- **网络代理**：组件更新优先使用设置中的代理，未填写时依次读取 `HTTPS_PROXY`、`ALL_PROXY`、`HTTP_PROXY`（含小写形式）。支持 HTTP、HTTPS、SOCKS4/4a、SOCKS5/5h、IPv6 地址及 URL 编码的账号密码。网络代理与 GitHub 加速可同时使用：请求经用户代理到达加速服务；无效配置明确报错，不会静默绕过代理。设置里的网络修改会立即用于手动检查更新和安装，点击「保存」后供后续会话使用；取消仍保留原配置。视频解析与下载继续使用网络代理，GitHub 镜像仅用于组件更新。
 - **版本检索**：启动后后台查询，设置 → 运行环境也可分别手动检查；不自动安装。yt-dlp 按数字版本比较；FFmpeg 按发布时间和资产摘要识别滚动构建，避免 `latest` 标签恒定造成漏报。检查失败会显示错误，不冒充「已是最新」。
 - **平台**：Windows x64/ARM64、Linux x64/ARM64 使用对应的 BtbN LGPL shared 资产。macOS 的 yt-dlp 可托管更新；FFmpeg 当前通过现有安装/Homebrew 管理，BtbN 不提供 macOS 构建，界面会明确报告无匹配资产。
 - **韧性**：断点续传（HTTP Range）+ 4 次重试与指数退避，针对 `os error 10060` 这类中途停滞。

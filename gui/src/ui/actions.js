@@ -401,7 +401,7 @@ async function checkUpdates(component) {
   patch({ checkingUpdates: true });
   render(state());
   try {
-    const result = await call("check_updates", { component });
+    const result = await call("check_updates", { component, network: settings.getUpdateNetwork() });
     patch({
       checkingUpdates: false,
       updates: { ...(state().updates || {}), [component]: result },
@@ -419,7 +419,9 @@ async function installUpdate(component) {
   patch({ updating: component, updateProgress: null });
   render(state());
   try {
-    const report = await call(component === "ffmpeg" ? "install_ffmpeg_update" : "install_ytdlp_update");
+    const report = await call(component === "ffmpeg" ? "install_ffmpeg_update" : "install_ytdlp_update", {
+      network: settings.getUpdateNetwork(),
+    });
     patch({
       updating: null,
       updateProgress: null,
@@ -700,6 +702,8 @@ export function installActions(root) {
       downloadCurrent();
     }
     if (event.key === "Escape") {
+      // Let the select dismiss its picker before closing the settings dialog.
+      if (CSS.supports("selector(select:open)") && root.querySelector("select:open")) return;
       if (state().parserOpen) {
         patch({parserOpen:false}); render(state());
       } else if (state().drawerTaskId) {

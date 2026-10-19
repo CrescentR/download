@@ -622,6 +622,17 @@ pub fn analyze_blocking(url: &str, settings: &crate::settings::Settings, shallow
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_proxy_is_forwarded_to_video_analysis_without_github_rewriting() {
+        let mut settings = crate::settings::Settings::default();
+        settings.proxy = " socks5h://user:p%40ss@127.0.0.1:1080 ".into();
+        let args = probe_args("https://example.com/video", &settings, None, false);
+        let proxy_index = args.iter().position(|arg| arg == "--proxy").unwrap();
+        assert_eq!(args[proxy_index + 1], "socks5h://user:p%40ss@127.0.0.1:1080");
+        assert_eq!(args.last().unwrap(), "https://example.com/video");
+        assert!(!args.iter().any(|arg| arg.contains("gh-proxy.com")));
+    }
     use std::io::Write as _;
     use std::net::TcpListener;
     fn settings() -> crate::settings::Settings {

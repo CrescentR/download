@@ -183,6 +183,7 @@ function networkSection() {
     ${field(t("cookiesPaste"), t("cookiesPasteHint"),
       `<textarea class="input mono cookie-text" data-setting="cookieText" rows="3" spellcheck="false" autocomplete="off" aria-label="${t('cookiesPaste')}" placeholder="Cookie: name=value; name=value">${escapeHtml(draft.cookieText || '')}</textarea>`, true)}
     ${field(t("proxy"), t("proxyHint"), textControl("proxy", "http://127.0.0.1:7890", "input mono w-lg"))}
+    ${field(t("githubMirror"), t("githubMirrorHint"), textControl("githubMirror", "https://gh-proxy.com", "input mono w-lg"))}
     ${field(t("rateLimit"), t("rateLimitHint"), textControl("rateLimit", "2M", "input w-sm"))}
     ${field(t("retries"), "", numberControl("retries", 0, 50))}
     ${field(t("concurrentFragments"), t("concurrentFragmentsHint"), numberControl("concurrentFragments", 1, 16))}
@@ -412,6 +413,12 @@ export function closeSettings() {
 
 export function getDraft() {
   return draft;
+}
+
+/** Only pass network edits to updates; the settings draft is saved separately. */
+export function getUpdateNetwork() {
+  if (!draft) return null;
+  return { proxy: draft.proxy ?? "", githubMirror: draft.githubMirror ?? "https://gh-proxy.com" };
 }
 
 export function patchSettings(state) {

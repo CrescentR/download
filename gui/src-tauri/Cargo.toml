@@ -24,6 +24,6 @@ tauri = { version = "~2.12.4", features = [] }
 tauri-plugin-dialog = "~2.7.1"
 tauri-plugin-opener = "2"
 thiserror = "2"
-ureq = { version = "2", features = ["json", "tls", "socks-proxy"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "socks"] }
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -61,6 +61,7 @@ const previewSettings = {
   cookiesBrowser: "",
   cookiesFile: "",
   proxy: "",
+  githubMirror: "https://gh-proxy.com",
   rateLimit: "",
   concurrentFragments: 4,
   retries: 10,

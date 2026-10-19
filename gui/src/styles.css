@@ -1368,6 +1368,90 @@ textarea.input:focus {
   flex: 0 0 auto;
 }
 
+/* Keep native select semantics while styling its top-layer picker to match
+   the desktop panel. Older webviews retain a theme-aware native menu. */
+select.input {
+  cursor: pointer;
+}
+
+select.input option {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
+@supports (appearance: base-select) {
+  select.input,
+  select.input::picker(select) {
+    appearance: base-select;
+  }
+
+  select.input {
+    display: inline-flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    color: var(--text);
+    text-align: start;
+  }
+
+  select.input::picker-icon {
+    flex-shrink: 0;
+    color: var(--text-3);
+    font-size: 10px;
+    transition: rotate 140ms var(--ease);
+  }
+
+  select.input:open::picker-icon {
+    rotate: 180deg;
+  }
+
+  select.input::picker(select) {
+    margin-block: 5px;
+    padding: 4px;
+    max-block-size: min(280px, 50dvh);
+    overflow-y: auto;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    color: var(--text);
+    box-shadow: var(--shadow-lg);
+    font-family: var(--font);
+    font-size: 12px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+
+  select.input option {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-block-size: 32px;
+    padding: 6px 9px;
+    border: 0;
+    border-radius: 4px;
+    outline: none;
+    line-height: 20px;
+    cursor: pointer;
+  }
+
+  select.input option:checked {
+    background: var(--surface-3);
+    font-weight: 500;
+  }
+
+  select.input option:hover,
+  select.input option:focus-visible {
+    background: var(--accent-soft);
+  }
+
+  select.input option::checkmark {
+    order: 1;
+    margin-inline-start: auto;
+    color: var(--text-2);
+    font-size: 12px;
+  }
+}
+
 .row-inline {
   display: flex;
   flex: 1;

@@ -6,6 +6,16 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const DEFAULT_GITHUB_MIRROR: &str = "https://gh-proxy.com";
+
+/// Network settings captured when an update starts, including unsaved edits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateNetwork {
+    pub proxy: String,
+    pub github_mirror: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
@@ -36,6 +46,10 @@ pub struct Settings {
     pub download_archive: String,
     /// Empty means "use the managed FFmpeg, or whatever is on PATH".
     pub ffmpeg_location: String,
+    /// GitHub mirror prefix for update checks/downloads, e.g.
+    /// Defaults to GH-Proxy for new/legacy configs. Explicitly clearing it
+    /// disables URL rewriting, while still respecting the network proxy.
+    pub github_mirror: String,
 }
 
 impl Default for Settings {
@@ -71,6 +85,7 @@ impl Default for Settings {
             clipboard_watch: true,
             download_archive: String::new(),
             ffmpeg_location: String::new(),
+            github_mirror: DEFAULT_GITHUB_MIRROR.into(),
         }
     }
 }
@@ -124,6 +139,13 @@ fn read_settings(path: &Path) -> Settings {
 }
 
 impl Settings {
+    pub fn apply_update_network(&mut self, network: Option<UpdateNetwork>) {
+        if let Some(network) = network {
+            self.proxy = network.proxy;
+            self.github_mirror = network.github_mirror;
+        }
+    }
+
     fn normalize(&mut self) {
         let defaults = Self::default();
         if self.output_template.trim().is_empty() { self.output_template = defaults.output_template; }
@@ -132,6 +154,8 @@ impl Settings {
         self.max_concurrent_downloads = self.max_concurrent_downloads.clamp(1, 10);
         self.concurrent_fragments = self.concurrent_fragments.clamp(1, 16);
         self.retries = self.retries.min(50);
+        self.proxy = self.proxy.trim().to_string();
+        self.github_mirror = self.github_mirror.trim().trim_end_matches('/').to_string();
     }
 }
 
@@ -208,6 +232,34 @@ pub fn save_history(app: &tauri::AppHandle, value: &serde_json::Value) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_configs_use_default_mirror_but_explicit_choices_survive() {
+        let legacy: Settings = serde_json::from_str(r#"{"proxy":"http://127.0.0.1:7890"}"#).unwrap();
+        assert_eq!(legacy.github_mirror, DEFAULT_GITHUB_MIRROR);
+        assert_eq!(legacy.proxy, "http://127.0.0.1:7890");
+        for mirror in ["", "https://custom.example/prefix"] {
+            let mut value = Settings::default();
+            value.github_mirror = mirror.into();
+            let mut restored: Settings = serde_json::from_str(&serde_json::to_string(&value).unwrap()).unwrap();
+            restored.normalize();
+            assert_eq!(restored.github_mirror, mirror);
+        }
+    }
+
+    #[test]
+    fn update_network_draft_overrides_only_network_settings() {
+        let mut value = Settings::default();
+        value.proxy = "http://old.example:8080".into();
+        value.apply_update_network(Some(UpdateNetwork {
+            proxy: "socks5h://user:pass@127.0.0.1:1080".into(), github_mirror: String::new(),
+        }));
+        assert_eq!(value.proxy, "socks5h://user:pass@127.0.0.1:1080");
+        assert_eq!(value.github_mirror, "");
+        assert_eq!(value.output_template, Settings::default().output_template);
+        value.apply_update_network(None);
+        assert_eq!(value.github_mirror, "");
+    }
 
     #[test]
     fn settings_round_trip_preserves_audio_and_playlist_choices() {

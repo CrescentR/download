@@ -1292,6 +1292,19 @@ mod tests {
     }
 
     #[test]
+    fn saved_proxy_applies_to_downloads_and_task_override_wins() {
+        let mut request = payload(&["https://example.com/v"]);
+        let mut settings = Settings::default();
+        settings.proxy = " socks5h://user:p%40ss@127.0.0.1:1080 ".into();
+        let (args, _) = build_args_with_ffmpeg(&request, &settings, None, None).unwrap();
+        assert_eq!(value_after(&args, "--proxy"), Some("socks5h://user:p%40ss@127.0.0.1:1080"));
+        assert!(!args.iter().any(|arg| arg.contains("gh-proxy.com")));
+        request.proxy = "http://127.0.0.1:7890".into();
+        let (args, _) = build_args_with_ffmpeg(&request, &settings, None, None).unwrap();
+        assert_eq!(value_after(&args, "--proxy"), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
     fn cookie_file_fallback_skips_browser_extraction_during_download() {
         let mut request = payload(&["https://example.com/v"]);
         request.cookies_browser = "chrome".into();

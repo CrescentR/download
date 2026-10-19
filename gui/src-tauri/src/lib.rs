@@ -394,6 +394,7 @@ fn get_settings(app: AppHandle) -> settings::Settings {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, mut value: settings::Settings, cookie_text: Option<String>, cookie_site: Option<String>) -> Result<settings::Settings, String> {
+    update::validate_network(&value.proxy, &value.github_mirror).map_err(|error| error.to_string())?;
     let imported = if let Some(text) = cookie_text.filter(|text| !text.trim().is_empty()) {
         let path = cookies::import_for_site(&text, &settings::config_dir(&app).join("cookies"), cookie_site.as_deref().unwrap_or("bilibili"), &value.cookies_file)?;
         value.cookies_file = path.clone();
@@ -419,21 +420,24 @@ async fn runtime_info(manager: State<'_, Arc<DownloadManager>>) -> Result<runtim
 async fn check_updates(
     manager: State<'_, Arc<DownloadManager>>,
     component: String,
+    network: Option<settings::UpdateNetwork>,
 ) -> Result<update::UpdateCheck, String> {
     if component != "ytdlp" && component != "ffmpeg" {
         return Err("Unknown update component".into());
     }
     let config = settings::config_dir(&manager.app);
-    let settings = settings::load(&manager.app);
+    let mut settings = settings::load(&manager.app);
+    settings.apply_update_network(network);
     let proxy = update::resolve_proxy(Some(&settings.proxy));
+    let mirror = (!settings.github_mirror.trim().is_empty()).then(|| settings.github_mirror.clone());
 
     let check = tauri::async_runtime::spawn_blocking(move || {
         if component == "ffmpeg" {
             let current = deps::ffmpeg_status_with(Some(&config), &settings.ffmpeg_location).version;
-            update::check_ffmpeg(&config, current.as_deref(), proxy.as_deref())
+            update::check_ffmpeg(&config, current.as_deref(), proxy.as_deref(), mirror.as_deref())
         } else {
             let current = runtime::info_with(Some(&config)).ytdlp_version;
-            update::check_ytdlp(&config, current.as_deref(), proxy.as_deref())
+            update::check_ytdlp(&config, current.as_deref(), proxy.as_deref(), mirror.as_deref())
         }
     })
     .await
@@ -449,10 +453,13 @@ async fn check_updates(
 async fn install_ytdlp_update(
     app: AppHandle,
     manager: State<'_, Arc<DownloadManager>>,
+    network: Option<settings::UpdateNetwork>,
 ) -> Result<update::InstallReport, String> {
     let config = settings::config_dir(&manager.app);
-    let settings_value = settings::load(&manager.app);
+    let mut settings_value = settings::load(&manager.app);
+    settings_value.apply_update_network(network);
     let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    let mirror = (!settings_value.github_mirror.trim().is_empty()).then(|| settings_value.github_mirror.clone());
     let emitter = app.clone();
 
     let report = tauri::async_runtime::spawn_blocking(move || {
@@ -467,7 +474,7 @@ async fn install_ytdlp_update(
                 );
             }
         };
-        update::install_ytdlp(&config, proxy.as_deref(), &mut progress)
+        update::install_ytdlp(&config, proxy.as_deref(), mirror.as_deref(), &mut progress)
     })
     .await
     .map_err(|error| format!("update failed: {error}"))?
@@ -481,10 +488,13 @@ async fn install_ytdlp_update(
 async fn install_ffmpeg_update(
     app: AppHandle,
     manager: State<'_, Arc<DownloadManager>>,
+    network: Option<settings::UpdateNetwork>,
 ) -> Result<update::InstallReport, String> {
     let config = settings::config_dir(&manager.app);
-    let settings_value = settings::load(&manager.app);
+    let mut settings_value = settings::load(&manager.app);
+    settings_value.apply_update_network(network);
     let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    let mirror = (!settings_value.github_mirror.trim().is_empty()).then(|| settings_value.github_mirror.clone());
     let emitter = app.clone();
 
     let report = tauri::async_runtime::spawn_blocking(move || {
@@ -498,7 +508,7 @@ async fn install_ffmpeg_update(
                 );
             }
         };
-        update::install_ffmpeg(&config, proxy.as_deref(), &mut progress)
+        update::install_ffmpeg(&config, proxy.as_deref(), mirror.as_deref(), &mut progress)
     })
     .await
     .map_err(|error| format!("update failed: {error}"))?
@@ -1014,16 +1024,18 @@ fn run_check_updates() -> i32 {
     let config = settings::diagnose_config_dir();
     let settings_value = settings::load_for_diagnose();
     let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    let mirror = (!settings_value.github_mirror.trim().is_empty()).then(|| settings_value.github_mirror.clone());
 
     println!("== Yuki update check ==");
     println!("managed dir : {}", config.display());
-    println!("proxy       : {}", proxy.clone().unwrap_or_else(|| "none".into()));
+    println!("proxy       : {}", proxy.as_ref().map(|_| "configured").unwrap_or("none"));
+    println!("mirror      : {}", mirror.clone().unwrap_or_else(|| "none".into()));
 
     let runtime_info = runtime::info_with(Some(&config));
     println!("current     : {:?}", runtime_info.ytdlp_version);
     println!("mode        : {}", runtime_info.mode);
 
-    let check = update::check_ytdlp(&config, runtime_info.ytdlp_version.as_deref(), proxy.as_deref());
+    let check = update::check_ytdlp(&config, runtime_info.ytdlp_version.as_deref(), proxy.as_deref(), mirror.as_deref());
     println!("\nyt-dlp");
     println!("  current   : {:?}", check.current_version);
     println!("  latest    : {:?}", check.latest_version);
@@ -1037,6 +1049,7 @@ fn run_check_updates() -> i32 {
         &config,
         deps::ffmpeg_status().version.as_deref(),
         proxy.as_deref(),
+        mirror.as_deref(),
     );
     println!("\nffmpeg");
     println!("  current   : {:?}", ffmpeg.current_version);
@@ -1063,9 +1076,11 @@ fn run_install_ytdlp() -> i32 {
     let config = settings::diagnose_config_dir();
     let settings_value = settings::load_for_diagnose();
     let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    let mirror = (!settings_value.github_mirror.trim().is_empty()).then(|| settings_value.github_mirror.clone());
     println!("== Yuki: install latest yt-dlp ==");
     println!("target: {}", update::managed_ytdlp_path(&config).display());
-    println!("proxy : {}", proxy.clone().unwrap_or_else(|| "none".into()));
+    println!("proxy : {}", proxy.as_ref().map(|_| "configured").unwrap_or("none"));
+    println!("mirror: {}", mirror.clone().unwrap_or_else(|| "none".into()));
 
     let mut last = std::time::Instant::now();
     let mut progress = |written: u64, total: Option<u64>| {
@@ -1083,7 +1098,7 @@ fn run_install_ytdlp() -> i32 {
         }
     };
 
-    match update::install_ytdlp(&config, proxy.as_deref(), &mut progress) {
+    match update::install_ytdlp(&config, proxy.as_deref(), mirror.as_deref(), &mut progress) {
         Ok(report) => {
             println!("\ninstalled version : {}", report.version);
             println!("path              : {}", report.path);
@@ -1115,10 +1130,12 @@ fn run_install_ffmpeg() -> i32 {
     let config = settings::diagnose_config_dir();
     let settings_value = settings::load_for_diagnose();
     let proxy = update::resolve_proxy(Some(&settings_value.proxy));
+    let mirror = (!settings_value.github_mirror.trim().is_empty()).then(|| settings_value.github_mirror.clone());
 
     println!("== Yuki: install managed FFmpeg ==");
     println!("target: {}", update::managed_ffmpeg_dir(&config).display());
-    println!("proxy : {}", proxy.clone().unwrap_or_else(|| "none".into()));
+    println!("proxy : {}", proxy.as_ref().map(|_| "configured").unwrap_or("none"));
+    println!("mirror: {}", mirror.clone().unwrap_or_else(|| "none".into()));
 
     let mut last = std::time::Instant::now();
     let mut progress = |written: u64, total: Option<u64>| {
@@ -1136,7 +1153,7 @@ fn run_install_ffmpeg() -> i32 {
         }
     };
 
-    match update::install_ffmpeg(&config, proxy.as_deref(), &mut progress) {
+    match update::install_ffmpeg(&config, proxy.as_deref(), mirror.as_deref(), &mut progress) {
         Ok(report) => {
             println!("\ninstalled version : {}", report.version);
             println!("path              : {}", report.path);

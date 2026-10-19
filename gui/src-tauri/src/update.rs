@@ -123,6 +123,27 @@ struct GhReleaseListEntry {
 // Transport
 // ---------------------------------------------------------------------------
 
+/// Rewrite a GitHub URL through a mirror prefix when one is configured.
+///
+/// Mirrors such as `https://gh-proxy.com` expect the original URL appended to
+/// the prefix: `{mirror}/https://github.com/...`. Only `github.com` and
+/// GitHub API and content URLs are rewritten; anything else is passed through so an
+/// already-mirrored or third-party URL is never double-prefixed.
+pub fn apply_mirror(url: &str, mirror: Option<&str>) -> String {
+    let Some(mirror) = mirror.map(str::trim).filter(|value| !value.is_empty()) else {
+        return url.to_string();
+    };
+    let is_github = [
+        "https://github.com/", "https://api.github.com/",
+        "https://raw.githubusercontent.com/", "https://objects.githubusercontent.com/",
+        "https://release-assets.githubusercontent.com/",
+    ].iter().any(|prefix| url.starts_with(prefix));
+    if !is_github {
+        return url.to_string();
+    }
+    format!("{}/{}", mirror.trim_end_matches('/'), url)
+}
+
 /// Resolve the proxy for updater traffic.
 ///
 /// Order: the user's explicit setting, then the conventional environment
@@ -154,37 +175,89 @@ pub fn resolve_proxy(explicit: Option<&str>) -> Option<String> {
     None
 }
 
-fn agent(proxy: Option<&str>) -> ureq::Agent {
-    let mut builder = ureq::AgentBuilder::new()
+/// Reject invalid configuration instead of silently bypassing the user's proxy.
+fn parse_proxy(value: &str) -> Result<reqwest::Proxy, UpdateError> {
+    let value = value.trim();
+    let normalized = if let Some(address) = value.strip_prefix("socks://") {
+        format!("socks5://{address}")
+    } else if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    };
+    let invalid = || UpdateError::Other(
+        "Invalid updater proxy. Use http://host:port, https://host:port, socks5://host:port or socks5h://host:port. Username/password authentication is supported.".into()
+    );
+    let parsed = tauri::Url::parse(&normalized).map_err(|_| invalid())?;
+    if !matches!(parsed.scheme(), "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h")
+        || parsed.host_str().is_none_or(str::is_empty)
+        || parsed.port() == Some(0)
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some() || parsed.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    reqwest::Proxy::all(parsed).map_err(|_| invalid())
+}
+
+pub fn validate_network(proxy: &str, mirror: &str) -> Result<(), UpdateError> {
+    if !proxy.trim().is_empty() {
+        parse_proxy(proxy)?;
+    }
+    if !mirror.trim().is_empty() {
+        let invalid = || UpdateError::Other(
+            "Invalid GitHub mirror. Use an HTTP(S) URL prefix such as https://gh-proxy.com, or leave it empty to disable the mirror.".into()
+        );
+        let parsed = tauri::Url::parse(mirror.trim()).map_err(|_| invalid())?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
+            || !parsed.username().is_empty() || parsed.password().is_some()
+            || parsed.query().is_some() || parsed.fragment().is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn agent(proxy: Option<&str>) -> Result<reqwest::blocking::Client, UpdateError> {
+    let mut builder = reqwest::blocking::Client::builder()
+        // Proxy selection is explicit so environment/system settings never
+        // override a user setting, including authenticated and SOCKS proxies.
+        .no_proxy()
         .user_agent(USER_AGENT)
-        .timeout_connect(Duration::from_secs(25))
-        // Release assets run to ~40 MB; a slow link must not trip the timeout.
-        .timeout_read(Duration::from_secs(45))
-        .timeout_write(Duration::from_secs(60));
+        .connect_timeout(Duration::from_secs(25))
+        // The blocking client bounds each read operation. Unlike setting the
+        // async client's timeout, this allows long, steadily moving downloads.
+        .timeout(Duration::from_secs(45));
 
     if let Some(url) = proxy {
-        match ureq::Proxy::new(url) {
-            Ok(parsed) => builder = builder.proxy(parsed),
-            Err(_) => eprintln!("Ignoring invalid updater proxy; check the proxy setting"),
-        }
+        builder = builder.proxy(parse_proxy(url)?);
     }
 
     builder.build()
+        .map_err(|error| UpdateError::Network(error.without_url().to_string()))
 }
 
-fn latest_release(repo: &str, proxy: Option<&str>) -> Result<GhRelease, UpdateError> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    match agent(proxy)
-        .get(&url)
-        .set("Accept", "application/vnd.github+json")
-        .call()
-    {
-        Ok(response) => response
-            .into_json::<GhRelease>()
-            .map_err(|error| UpdateError::Network(error.to_string())),
-        Err(ureq::Error::Status(status, _)) => Err(UpdateError::Http { status, url }),
-        Err(error) => Err(UpdateError::Network(error.to_string())),
+fn send(request: reqwest::blocking::RequestBuilder) -> Result<reqwest::blocking::Response, UpdateError> {
+    let response = request.send().map_err(|error| {
+        let category = if error.is_timeout() { "timeout" } else if error.is_connect() { "connection failed" } else { "request failed" };
+        UpdateError::Network(format!("{category}: {}", error.without_url()))
+    })?;
+    if !response.status().is_success() {
+        return Err(UpdateError::Http { status: response.status().as_u16(), url: response.url().to_string() });
     }
+    Ok(response)
+}
+
+fn latest_release(repo: &str, proxy: Option<&str>, mirror: Option<&str>) -> Result<GhRelease, UpdateError> {
+    validate_network(proxy.unwrap_or(""), mirror.unwrap_or(""))?;
+    let url = apply_mirror(&format!("https://api.github.com/repos/{repo}/releases/latest"), mirror);
+    send(agent(proxy)?
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(45)))?
+        .json::<GhRelease>()
+        .map_err(|error| UpdateError::Network(error.without_url().to_string()))
 }
 
 /// Transient failures seen in practice: a stalled read partway through an
@@ -209,6 +282,7 @@ fn is_retryable(error: &UpdateError) -> bool {
         "unexpected eof",
         "broken pipe",
         "temporarily unavailable",
+        "response body",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -219,8 +293,10 @@ pub fn download(
     url: &str,
     destination: &Path,
     proxy: Option<&str>,
+    mirror: Option<&str>,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<u64, UpdateError> {
+    validate_network(proxy.unwrap_or(""), mirror.unwrap_or(""))?;
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -229,7 +305,7 @@ pub fn download(
 
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
         let already = fs::metadata(destination).map(|meta| meta.len()).unwrap_or(0);
-        match download_once(url, destination, proxy, already, progress) {
+        match download_once(url, destination, proxy, mirror, already, progress) {
             Ok(written) => return Ok(written),
             Err(error) => {
                 let retryable = is_retryable(&error);
@@ -253,31 +329,27 @@ fn download_once(
     url: &str,
     destination: &Path,
     proxy: Option<&str>,
+    mirror: Option<&str>,
     already: u64,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<u64, UpdateError> {
-    let mut request = agent(proxy).get(url);
+    let mut request = agent(proxy)?.get(&apply_mirror(url, mirror));
     if already > 0 {
-        request = request.set("Range", &format!("bytes={already}-"));
+        request = request.header("Range", format!("bytes={already}-"));
     }
 
-    let response = request.call().map_err(|error| match error {
-        ureq::Error::Status(status, _) => UpdateError::Http {
-            status,
-            url: url.to_string(),
-        },
-        other => UpdateError::Network(other.to_string()),
-    })?;
+    let response = send(request)?;
 
     // A server that ignores `Range` answers 200; restart instead of appending.
     let resumed = response.status() == 206;
-    if resumed && !response.header("Content-Range").unwrap_or("").starts_with(&format!("bytes {already}-")) {
+    if resumed && !response.headers().get("Content-Range").and_then(|value| value.to_str().ok()).unwrap_or("").starts_with(&format!("bytes {already}-")) {
         return Err(UpdateError::Network("invalid Content-Range in resumed download".into()));
     }
     let mut written = if resumed { already } else { 0 };
 
     let total = response
-        .header("Content-Length")
+        .headers().get("Content-Length")
+        .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .map(|length| length + written);
     if let Some(total) = total {
@@ -288,7 +360,7 @@ fn download_once(
         }
     }
 
-    let mut reader = response.into_reader();
+    let mut reader = response;
     let mut file = if resumed {
         fs::OpenOptions::new().append(true).open(destination)?
     } else {
@@ -297,7 +369,7 @@ fn download_once(
 
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
-        let read = reader.read(&mut buffer)?;
+        let read = reader.read(&mut buffer).map_err(|error| UpdateError::Network(format!("response body: {error}")))?;
         if read == 0 {
             break;
         }
@@ -316,19 +388,13 @@ fn download_once(
     Ok(written)
 }
 
-fn fetch_text(url: &str, proxy: Option<&str>) -> Result<String, UpdateError> {
-    agent(proxy)
-        .get(url)
-        .call()
-        .map_err(|error| match error {
-            ureq::Error::Status(status, _) => UpdateError::Http {
-                status,
-                url: url.to_string(),
-            },
-            other => UpdateError::Network(other.to_string()),
-        })?
-        .into_string()
-        .map_err(|error| UpdateError::Network(error.to_string()))
+fn fetch_text(url: &str, proxy: Option<&str>, mirror: Option<&str>) -> Result<String, UpdateError> {
+    validate_network(proxy.unwrap_or(""), mirror.unwrap_or(""))?;
+    send(agent(proxy)?
+        .get(&apply_mirror(url, mirror))
+        .timeout(Duration::from_secs(45)))?
+        .text()
+        .map_err(|error| UpdateError::Network(error.without_url().to_string()))
 }
 
 /// Verify a file against the release's `SHA2-256SUMS`.
@@ -337,8 +403,9 @@ fn verify_checksum(
     sums_url: &str,
     asset_name: &str,
     proxy: Option<&str>,
+    mirror: Option<&str>,
 ) -> Result<(), UpdateError> {
-    let body = fetch_text(sums_url, proxy)?;
+    let body = fetch_text(sums_url, proxy, mirror)?;
 
     let expected = body
         .lines()
@@ -547,6 +614,7 @@ pub fn check_ytdlp(
     config_dir: &Path,
     current_version: Option<&str>,
     proxy: Option<&str>,
+    mirror: Option<&str>,
 ) -> UpdateCheck {
     let _ = config_dir;
     let mut check = UpdateCheck {
@@ -562,7 +630,7 @@ pub fn check_ytdlp(
         error: None,
     };
 
-    match latest_release(YTDLP_REPO, proxy) {
+    match latest_release(YTDLP_REPO, proxy, mirror) {
         Ok(release) => {
             check.latest_version = Some(release.tag_name.clone());
             check.published_at = release.published_at.clone();
@@ -597,10 +665,11 @@ pub fn check_ytdlp(
 pub fn install_ytdlp(
     config_dir: &Path,
     proxy: Option<&str>,
+    mirror: Option<&str>,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<InstallReport, UpdateError> {
     let _guard = INSTALL_LOCK.try_lock().map_err(|_| UpdateError::Other("Another dependency installation is in progress".into()))?;
-    let release = latest_release(YTDLP_REPO, proxy)?;
+    let release = latest_release(YTDLP_REPO, proxy, mirror)?;
     let candidates = ytdlp_asset_candidates();
     let asset = pick_asset(&release.assets, &candidates)
         .ok_or_else(|| UpdateError::NoAsset(candidates.join(", ")))?;
@@ -609,7 +678,7 @@ pub fn install_ytdlp(
     let staging = target.with_extension(if cfg!(windows) { "download.exe" } else { "download" });
     let _ = fs::remove_file(&staging);
 
-    let bytes = download(&asset.browser_download_url, &staging, proxy, progress)?;
+    let bytes = download(&asset.browser_download_url, &staging, proxy, mirror, progress)?;
 
     // Integrity: a truncated or tampered binary must never be installed.
     let sums = release
@@ -617,7 +686,7 @@ pub fn install_ytdlp(
         .iter()
         .find(|candidate| candidate.name == "SHA2-256SUMS")
         .ok_or_else(|| UpdateError::Other("Release has no SHA2-256SUMS; refusing an unverified install".into()))?;
-    verify_checksum(&staging, &sums.browser_download_url, &asset.name, proxy).inspect_err(|_| {
+    verify_checksum(&staging, &sums.browser_download_url, &asset.name, proxy, mirror).inspect_err(|_| {
             let _ = fs::remove_file(&staging);
         })?;
 
@@ -661,19 +730,18 @@ fn ffmpeg_pattern() -> &'static str {
 }
 
 /// BtbN's "latest" tag is rolling, so the list endpoint is used.
-fn ffmpeg_releases(proxy: Option<&str>) -> Result<Vec<GhReleaseListEntry>, UpdateError> {
-    let url = format!("https://api.github.com/repos/{FFMPEG_REPO}/releases?per_page=10");
-    match agent(proxy)
+fn ffmpeg_releases(proxy: Option<&str>, mirror: Option<&str>) -> Result<Vec<GhReleaseListEntry>, UpdateError> {
+    validate_network(proxy.unwrap_or(""), mirror.unwrap_or(""))?;
+    let url = apply_mirror(
+        &format!("https://api.github.com/repos/{FFMPEG_REPO}/releases?per_page=10"),
+        mirror,
+    );
+    send(agent(proxy)?
         .get(&url)
-        .set("Accept", "application/vnd.github+json")
-        .call()
-    {
-        Ok(response) => response
-            .into_json::<Vec<GhReleaseListEntry>>()
-            .map_err(|error| UpdateError::Network(error.to_string())),
-        Err(ureq::Error::Status(status, _)) => Err(UpdateError::Http { status, url }),
-        Err(error) => Err(UpdateError::Network(error.to_string())),
-    }
+        .header("Accept", "application/vnd.github+json")
+        .timeout(Duration::from_secs(45)))?
+        .json::<Vec<GhReleaseListEntry>>()
+        .map_err(|error| UpdateError::Network(error.without_url().to_string()))
 }
 
 fn find_ffmpeg_asset(releases: &[GhReleaseListEntry]) -> Option<(String, GhAsset)> {
@@ -705,6 +773,7 @@ pub fn check_ffmpeg(
     config_dir: &Path,
     current_version: Option<&str>,
     proxy: Option<&str>,
+    mirror: Option<&str>,
 ) -> UpdateCheck {
     let managed = managed_ffmpeg_version(config_dir);
     let installed = managed.clone().or_else(|| current_version.map(str::to_string));
@@ -726,7 +795,7 @@ pub fn check_ffmpeg(
         check.error = Some("FFmpeg on macOS is managed with Homebrew. Run brew install ffmpeg (or brew upgrade ffmpeg), then Recheck.".into());
         return check;
     }
-    match ffmpeg_releases(proxy) {
+    match ffmpeg_releases(proxy, mirror) {
         Ok(releases) => match find_ffmpeg_asset(&releases) {
             Some((tag, asset)) => {
                 check.latest_version = Some(tag.clone());
@@ -837,10 +906,11 @@ fn replace_directory(staged: &Path, target: &Path) -> Result<(), UpdateError> {
 pub fn install_ffmpeg(
     config_dir: &Path,
     proxy: Option<&str>,
+    mirror: Option<&str>,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<InstallReport, UpdateError> {
     let _guard = INSTALL_LOCK.try_lock().map_err(|_| UpdateError::Other("Another dependency installation is in progress".into()))?;
-    let releases = ffmpeg_releases(proxy)?;
+    let releases = ffmpeg_releases(proxy, mirror)?;
     let (tag, asset) = find_ffmpeg_asset(&releases)
         .ok_or_else(|| UpdateError::NoAsset(ffmpeg_pattern().into()))?;
     let destination = managed_ffmpeg_dir(config_dir);
@@ -848,7 +918,7 @@ pub fn install_ffmpeg(
     fs::create_dir_all(&work)?;
     let result = (|| {
         let archive = work.join("archive");
-        let bytes = download(&asset.browser_download_url, &archive, proxy, progress)?;
+        let bytes = download(&asset.browser_download_url, &archive, proxy, mirror, progress)?;
         // Rolling download URLs can change between check and download. Digest mismatch
         // must fail closed; the previous installation is still untouched.
         if let Some(expected) = asset.digest.as_deref().and_then(|value| value.strip_prefix("sha256:")) {
@@ -860,7 +930,7 @@ pub fn install_ffmpeg(
             let sums = releases.iter().flat_map(|release| &release.assets)
                 .find(|candidate| candidate.name == "checksums.sha256")
                 .ok_or_else(|| UpdateError::Other("No FFmpeg checksum published".into()))?;
-            verify_checksum(&archive, &sums.browser_download_url, &asset.name, proxy)?;
+            verify_checksum(&archive, &sums.browser_download_url, &asset.name, proxy, mirror)?;
         }
         let extracted = work.join("extracted");
         extract_ffmpeg(&archive, &extracted, asset.name.ends_with(".zip"))?;
@@ -884,6 +954,141 @@ pub fn install_ffmpeg(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{TcpListener, TcpStream};
+
+    fn accept_fixture(listener: &TcpListener) -> TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    // Windows accepted sockets inherit the listener's mode.
+                    stream.set_nonblocking(false).unwrap();
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline, "proxy was bypassed");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fixture accept failed: {error}"),
+            }
+        }
+    }
+
+    fn read_http_headers(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+            assert!(bytes.len() < 16 * 1024);
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn custom_mirror_and_authenticated_http_proxy_cover_all_update_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("http://user:p%40ss@{}", listener.local_addr().unwrap());
+        let mirror = "http://mirror.invalid/prefix/";
+        let content = b"prefix-tail";
+        use sha2::{Digest, Sha256};
+        let sums = format!("{:x}  asset.bin\n", Sha256::digest(content));
+        let server = std::thread::spawn(move || {
+            let responses = [
+                ("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", "200 OK", r#"{"tag_name":"v1","assets":[]}"#.to_string(), ""),
+                ("https://api.github.com/repos/BtbN/FFmpeg-Builds/releases?per_page=10", "200 OK", "[]".into(), ""),
+                ("https://github.com/a/b/releases/download/v1/asset.bin", "206 Partial Content", "tail".into(), "Content-Range: bytes 7-10/11\r\n"),
+                ("https://github.com/a/b/releases/download/v1/SHA2-256SUMS", "200 OK", sums, ""),
+            ];
+            for (target, status, body, extra) in responses {
+                let mut stream = accept_fixture(&listener);
+                let headers = read_http_headers(&mut stream);
+                assert!(headers.starts_with(&format!("GET http://mirror.invalid/prefix/{target} HTTP/1.1\r\n")), "{headers}");
+                assert!(headers.to_lowercase().contains("proxy-authorization: basic dxnlcjpwqhnz\r\n"));
+                if status.starts_with("206") {
+                    assert!(headers.to_lowercase().contains("range: bytes=7-\r\n"));
+                }
+                write!(stream, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len()).unwrap();
+            }
+        });
+        assert_eq!(latest_release(YTDLP_REPO, Some(&proxy), Some(mirror)).unwrap().tag_name, "v1");
+        assert!(ffmpeg_releases(Some(&proxy), Some(mirror)).unwrap().is_empty());
+        let dir = temp_dir();
+        let file = dir.join("asset.bin");
+        fs::write(&file, b"prefix-").unwrap();
+        let mut progress = Vec::new();
+        let url = "https://github.com/a/b/releases/download/v1/asset.bin";
+        assert_eq!(download(url, &file, Some(&proxy), Some(mirror), &mut |done, total| progress.push((done, total))).unwrap(), 11);
+        assert_eq!(fs::read(&file).unwrap(), content);
+        assert_eq!(progress.last(), Some(&(11, Some(11))));
+        verify_checksum(&file, "https://github.com/a/b/releases/download/v1/SHA2-256SUMS", "asset.bin", Some(&proxy), Some(mirror)).unwrap();
+        server.join().unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn socks5h_uses_remote_dns_and_authentication_with_a_custom_mirror() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy = format!("socks5h://user:p%40ss@{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut stream = accept_fixture(&listener);
+            let mut greeting = [0; 2];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0; greeting[1] as usize];
+            stream.read_exact(&mut methods).unwrap();
+            assert!(methods.contains(&2));
+            stream.write_all(&[5, 2]).unwrap();
+            let mut auth = [0; 2];
+            stream.read_exact(&mut auth).unwrap();
+            assert_eq!(auth, [1, 4]);
+            let mut user = [0; 4];
+            stream.read_exact(&mut user).unwrap();
+            assert_eq!(&user, b"user");
+            let mut length = [0];
+            stream.read_exact(&mut length).unwrap();
+            let mut password = vec![0; length[0] as usize];
+            stream.read_exact(&mut password).unwrap();
+            assert_eq!(password, b"p@ss");
+            stream.write_all(&[1, 0]).unwrap();
+            let mut connect = [0; 5];
+            stream.read_exact(&mut connect).unwrap();
+            assert_eq!(&connect[..4], &[5, 1, 0, 3]);
+            let mut domain = vec![0; connect[4] as usize];
+            stream.read_exact(&mut domain).unwrap();
+            assert_eq!(domain, b"mirror.invalid");
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).unwrap();
+            assert_eq!(u16::from_be_bytes(port), 80);
+            stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 80]).unwrap();
+            let headers = read_http_headers(&mut stream);
+            assert!(headers.starts_with("GET /https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest HTTP/1.1\r\n"));
+            assert!(!headers.to_lowercase().contains("authorization:"));
+            let body = r#"{"tag_name":"v2","assets":[]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        assert_eq!(latest_release(YTDLP_REPO, Some(&proxy), Some("http://mirror.invalid")).unwrap().tag_name, "v2");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn invalid_network_settings_fail_without_exposing_credentials() {
+        for proxy in ["ftp://user:secret@host:21", "http://host:99999", "http://host:0", "http://host/path"] {
+            let error = agent(Some(proxy)).err().expect("invalid proxy must fail").to_string();
+            assert!(!error.contains("secret"));
+        }
+        for proxy in ["http://[::1]:8080", "https://proxy.example:8443", "socks5://user:p%40ss@host:1080", "socks5h://host:1080", "127.0.0.1:7890"] {
+            assert!(parse_proxy(proxy).is_ok(), "{proxy}");
+        }
+        for mirror in ["gh-proxy.com", "file:///tmp", "https://user:secret@host", "https://host?target=", "https://host/#fragment"] {
+            assert!(validate_network("", mirror).is_err(), "{mirror}");
+        }
+        let error = latest_release(YTDLP_REPO, Some("ftp://user:secret@host"), None).unwrap_err().to_string();
+        assert!(!error.contains("secret"));
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("yuki-update-test-{}", uuid::Uuid::new_v4()));
@@ -1046,6 +1251,37 @@ mod tests {
     fn an_explicit_proxy_setting_is_preferred() {
         let resolved = resolve_proxy(Some("http://127.0.0.1:7890"));
         assert_eq!(resolved.as_deref(), Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn mirror_prefixes_github_urls_only() {
+        let mirror = Some("https://gh-proxy.com");
+        assert_eq!(
+            apply_mirror("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", mirror),
+            "https://gh-proxy.com/https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+        );
+        assert_eq!(
+            apply_mirror("https://github.com/yt-dlp/yt-dlp/releases/download/x/yt-dlp.exe", mirror),
+            "https://gh-proxy.com/https://github.com/yt-dlp/yt-dlp/releases/download/x/yt-dlp.exe"
+        );
+        // A trailing slash on the mirror must not produce a double slash.
+        assert_eq!(
+            apply_mirror("https://github.com/a/b", Some("https://gh-proxy.com/")),
+            "https://gh-proxy.com/https://github.com/a/b"
+        );
+        // Non-GitHub URLs pass through untouched.
+        assert_eq!(
+            apply_mirror("https://example.com/file.zip", mirror),
+            "https://example.com/file.zip"
+        );
+    }
+
+    #[test]
+    fn blank_mirror_means_direct_connection() {
+        let url = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+        assert_eq!(apply_mirror(url, None), url);
+        assert_eq!(apply_mirror(url, Some("   ")), url);
+        assert_eq!(apply_mirror(url, Some("")), url);
     }
 
     #[test]
